@@ -32,6 +32,11 @@ Persistent memory + learning loop for Pi, extended with the Obsidian-style three
 - Consolidation at 100% (async — writes always succeed instantly, store may briefly exceed cap)
 - Recovery-snapshot pruning (≤64 files steady state)
 
+## Reference / inspiration
+
+The three-tier vault design was inspired by:
+- **How I use Obsidian as the long-term memory backbone for my AI assistant** (r/hermesagent): https://www.reddit.com/r/hermesagent/comments/1stz6gd/how_i_use_obsidian_as_the_longterm_memory/
+
 ## Fork features (beyond upstream)
 
 - **Async overflow consolidation**: capacity writes never block or fail (`addWithConsolidation` async path in `src/store/memory-store.ts`)
