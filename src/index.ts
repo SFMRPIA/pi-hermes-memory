@@ -36,6 +36,10 @@ import { registerMemoryTool } from "./tools/memory-tool.js";
 import { registerSkillTool } from "./tools/skill-tool.js";
 import { registerSessionSearchTool } from "./tools/session-search-tool.js";
 import { registerMemorySearchTool } from "./tools/memory-search-tool.js";
+import { registerVaultLogTool } from "./tools/vault-log.js";
+import { registerVaultSearchTool } from "./tools/vault-search.js";
+import { setupVaultPromotion } from "./handlers/vault-promotion.js";
+import { ensureDailyNote, vaultConfigured } from "./handlers/vault-notes.js";
 import { setupBackgroundReview } from "./handlers/background-review.js";
 import { setupSessionFlush } from "./handlers/session-flush.js";
 import { registerInsightsCommand } from "./handlers/insights.js";
@@ -202,6 +206,21 @@ export default function (pi: ExtensionAPI) {
 
   // ── 3. Register the memory tool (with project store + SQLite sync) ──
   registerMemoryTool(pi, store, projectStore, dbManager, projectName);
+
+  // ── 3b. Vault (Obsidian-style long-term memory) ──
+  registerVaultLogTool(pi, config);
+  registerVaultSearchTool(pi, config);
+  setupVaultPromotion(pi, store, projectStore, config);
+  pi.on("session_start", async () => {
+    // Ensure today's daily note exists — never block session start.
+    if (config.vaultDailyNotes !== false && vaultConfigured(config.vaultPath)) {
+      try {
+        await ensureDailyNote(config.vaultPath);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
 
   // ── 4. Register the skill tool ──
   registerSkillTool(pi, skillStore);

@@ -32,6 +32,10 @@ export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 600000;
 export const DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS = 7;
 export const DEFAULT_FAILURE_INJECTION_MAX_ENTRIES = 5;
 
+// ─── Vault (Obsidian-style long-term memory) ───
+export const DEFAULT_VAULT_PROMOTE_THRESHOLD = 0.67;
+export const DEFAULT_VAULT_DAILY_NOTES = true;
+
 // ─── File names ───
 export const MEMORY_FILE = "MEMORY.md";
 export const USER_FILE = "USER.md";
@@ -236,6 +240,22 @@ export const CONSOLIDATION_PROMPT = `The memory is at capacity. Review the curre
 Each entry shows when it was created and last referenced in HTML comments (<!-- created=..., last=... -->). Use this to identify stale entries.
 
 Use the memory tool to make changes. Be aggressive about merging — less is more.`;
+
+export const PROMOTION_PROMPT = `You are promoting stable memory entries into a long-term knowledge vault (plain markdown, Obsidian-style).
+
+The vault living files under System/Assistant/ hold stable reference material:
+- context.md — operations, environment, active things to track
+- preferences.md — how the user likes things done
+- environment.md — hardware, tools, known issues
+- logs/issues-fixes-log.md — recurring problems and their fixes
+
+Rules:
+- Select entries that are STABLE reference material (configs, conventions, known issues, user preferences, environment facts). Leave transient session state alone.
+- For each promoted entry, write a concise, self-contained markdown section for the most fitting vault file. The file may already exist with other sections — your content will be appended.
+- Reply with STRICT JSON only — no markdown fences, no prose, nothing else:
+{"promote":[{"file":"System/Assistant/context.md","content":"## Section Title\\n- fact\\n"}, ...],"remove":["<exact full entry text to remove from hot memory>", ...]}
+- "remove" must contain the FULL original entry text (exactly as shown above, including any metadata comments) for every entry you promoted. Entries not promoted must NOT appear in "remove".
+- Do not invent entries or content. Preserve user preferences and corrections (highest priority).`;
 
 // ─── Correction detection patterns (two-pass filter) ───
 

@@ -14,6 +14,8 @@ import {
   DEFAULT_CONSOLIDATION_TIMEOUT_MS,
   DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
+  DEFAULT_VAULT_PROMOTE_THRESHOLD,
+  DEFAULT_VAULT_DAILY_NOTES,
 } from "./constants.js";
 import { AGENT_ROOT, normalizeConfiguredMemoryDir, normalizeProjectsMemoryDir } from "./paths.js";
 
@@ -59,6 +61,8 @@ const DEFAULT_CONFIG: MemoryConfig = {
   failureInjectionMaxAgeDays: DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   failureInjectionMaxEntries: DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
   consolidationTimeoutMs: DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  vaultPromoteThreshold: DEFAULT_VAULT_PROMOTE_THRESHOLD,
+  vaultDailyNotes: DEFAULT_VAULT_DAILY_NOTES,
   nudgeToolCalls: DEFAULT_NUDGE_TOOL_CALLS,
   projectsMemoryDir: DEFAULT_PROJECTS_MEMORY_DIR,
   sessionSearch: { variant: "legacy" },
@@ -149,6 +153,13 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
         if (trimmed.length > 0) config.llmModelOverride = trimmed;
       }
       if (isThinkingLevel(parsed.llmThinkingOverride)) config.llmThinkingOverride = parsed.llmThinkingOverride;
+      if (typeof parsed.vaultPath === "string" && parsed.vaultPath.trim().length > 0) {
+        config.vaultPath = parsed.vaultPath.trim();
+      }
+      if (typeof parsed.vaultPromoteThreshold === "number" && Number.isFinite(parsed.vaultPromoteThreshold)) {
+        config.vaultPromoteThreshold = Math.min(1, Math.max(0, parsed.vaultPromoteThreshold));
+      }
+      if (typeof parsed.vaultDailyNotes === "boolean") config.vaultDailyNotes = parsed.vaultDailyNotes;
       if (isStringArray(parsed.childExtensionPaths)) {
         const childExtensionPaths = [...new Set<string>(
           (parsed.childExtensionPaths as string[]).map((item) => item.trim()).filter(Boolean),

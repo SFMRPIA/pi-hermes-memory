@@ -82,6 +82,12 @@ export interface MemoryConfig {
   nudgeToolCalls: number;
   /** Maximum time in milliseconds for a consolidation run, auto or manual. Default: 180000 */
   consolidationTimeoutMs: number;
+  /** Obsidian-style vault root for long-term promotion. Empty/undefined = disabled. */
+  vaultPath?: string;
+  /** Fraction of capacity at which stable entries promote to the vault. Default: 0.67 */
+  vaultPromoteThreshold: number;
+  /** Ensure a Daily/YYYY-MM-DD.md note exists on session start. Default: true */
+  vaultDailyNotes: boolean;
 }
 
 export type MemoryCategory =
