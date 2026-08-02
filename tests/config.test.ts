@@ -30,7 +30,7 @@ describe("loadConfig", () => {
     assert.strictEqual(config.flushRecentMessages, 0);
     assert.strictEqual(config.memoryOverflowStrategy, "auto-consolidate");
     assert.strictEqual(config.autoConsolidate, true);
-    assert.strictEqual(config.consolidationTimeoutMs, 180000);
+    assert.strictEqual(config.consolidationTimeoutMs, 600000);
     assert.strictEqual(config.failureInjectionEnabled, true);
     assert.strictEqual(config.failureInjectionMaxAgeDays, 7);
     assert.strictEqual(config.failureInjectionMaxEntries, 5);
@@ -47,8 +47,8 @@ describe("loadConfig", () => {
     console.warn = (message?: unknown) => { warnings.push(String(message)); };
 
     try {
-      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationTimeoutMs: 300000 }));
-      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationTimeoutMs, 300000);
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationTimeoutMs: 900000 }));
+      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationTimeoutMs, 900000);
       assert.deepStrictEqual(warnings, [], "a value above the default should not warn");
 
       fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationTimeoutMs: 60000 }));
@@ -58,7 +58,7 @@ describe("loadConfig", () => {
         "a lower configured value must be honored, not clamped",
       );
       assert.strictEqual(warnings.length, 1, "a sub-default value should warn once");
-      assert.match(warnings[0], /60000ms.*below the 180000ms default/);
+      assert.match(warnings[0], /60000ms.*below the 600000ms default/);
     } finally {
       console.warn = originalWarn;
     }

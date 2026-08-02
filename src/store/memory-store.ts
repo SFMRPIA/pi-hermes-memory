@@ -31,6 +31,8 @@ import { canonicalMarkdownIdentity, withMarkdownMutationLock } from "./markdown-
 
 const MAX_EXTERNAL_WRITE_RETRIES = 2;
 const RECOVERY_ACTIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+const RECOVERY_ACTIVE_MAX_COUNT = 32;
+const RECOVERY_ACTIVE_MAX_BYTES = 8 * 1024 * 1024;
 const RETIRED_RECOVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const RETIRED_RECOVERY_MAX_COUNT = 32;
 const RETIRED_RECOVERY_MAX_BYTES = 64 * 1024 * 1024;
@@ -49,6 +51,9 @@ export class MemoryStore {
   private storagePaths: Partial<Record<"memory" | "user" | "failure", string>> = {};
   private snapshot: MemorySnapshot = { memory: "", user: "" };
   private consolidator: ((target: "memory" | "user" | "failure", signal?: AbortSignal) => Promise<ConsolidationResult>) | null = null;
+
+  /** Targets with a background consolidation already scheduled (overflow path) */
+  private pendingConsolidations = new Set<"memory" | "user" | "failure">();
   private mutationObserver: ((target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>) | null = null;
 
   constructor(private config: MemoryConfig) {}
@@ -177,6 +182,7 @@ export class MemoryStore {
     signal?: AbortSignal,
     addedMessage = "Entry added.",
     project?: string,
+    allowOverflow = false,
   ): Promise<MemoryResult> {
     content = content.trim();
     if (!content) return { success: false, error: "Content cannot be empty." };
@@ -204,7 +210,7 @@ export class MemoryStore {
     const encoded = this.encodeEntry(content, today, today, project);
 
     const newTotal = [...entries, encoded].join(ENTRY_DELIMITER).length;
-    if (newTotal > limit) {
+    if (newTotal > limit && !allowOverflow) {
       const strategy = this.memoryOverflowStrategy();
 
       if (strategy === "fifo-evict") {
@@ -243,26 +249,40 @@ export class MemoryStore {
       return result;
     }
 
-    // Every failure mode (lock contention, spawn failure, non-zero exit, timeout
-    // kill) used to be swallowed here and present identically to a plain capacity
-    // error, making the auto path impossible to diagnose from outside (#135).
-    const consolidation = await this.consolidator(target, signal).catch(
-      (err): ConsolidationResult => ({ consolidated: false, error: `consolidator threw ${String(err).slice(0, 200)}` }),
+    // Async overflow path: accept the entry (the store temporarily exceeds
+    // its limit), return success immediately, and consolidate in the
+    // background. The user never waits on — or fails from — consolidation;
+    // the background run trims the store back under the limit. If it fails
+    // or pi exits mid-run, the file is over-cap but valid, and the next
+    // capacity write schedules another consolidation (self-healing).
+    const accepted = await this.runTargetMutation(
+      target,
+      () => this._add(target, content, signal, addedMessage, project, true),
     );
-    if (!consolidation.consolidated) {
-      const reason = consolidation.error || "no reason reported";
-      return { ...result, error: `${result.error} Auto-consolidation attempted but failed: ${reason}` };
+    if (!accepted.success) return accepted;
+
+    if (!this.pendingConsolidations.has(target)) {
+      this.pendingConsolidations.add(target);
+      void this.consolidateInBackground(target);
     }
 
+    return this.successResponse(
+      target,
+      "Memory saved. The store is temporarily over its limit; background consolidation is running.",
+    );
+  }
+
+  /** Background consolidation — never blocks the caller, never throws. */
+  private async consolidateInBackground(target: "memory" | "user" | "failure"): Promise<void> {
     try {
-      await this.loadFromDisk();
-    } catch (err) {
-      return { ...result, error: `${result.error} Auto-consolidation succeeded but reloading memory failed: ${String(err).slice(0, 200)}` };
+      // No signal: the caller's signal is aborted once the tool call returns,
+      // which would cancel background work before it starts.
+      await this.consolidator!(target, undefined);
+    } catch {
+      // Failure is already surfaced (console.warn) by the index.ts wrapper
+    } finally {
+      this.pendingConsolidations.delete(target);
     }
-
-    const retried = await this.addWithConsolidation(target, content, signal, retriesLeft - 1, addedMessage, project);
-    if (retried.success || !retried.error?.startsWith("Memory at ")) return retried;
-    return { ...retried, error: `${retried.error} Auto-consolidation ran but did not free enough space.` };
   }
 
   private async fifoEvictAndAdd(
@@ -867,16 +887,35 @@ export class MemoryStore {
     const activeCutoff = Date.now() - RECOVERY_ACTIVE_GRACE_MS;
     try {
       const names = await fs.readdir(directory);
-      await Promise.all(names.filter((name) => recoveryPattern.test(name)).map(async (name) => {
-        const recoveryPath = path.join(directory, name);
-        try {
-          const state = await fs.lstat(recoveryPath);
-          if (!state.isFile()) return;
-          if (state.mtimeMs >= activeCutoff) return;
-          await this.retireRecoveryFile(recoveryPath, filePath);
-        } catch {
+      // Keep snapshots that are BOTH recent (within the active grace period)
+      // AND within the count/bytes caps; retire everything else (the retired
+      // phase below prunes the tail).
+      const active = (await Promise.all(
+        names.filter((name) => recoveryPattern.test(name)).map(async (name) => {
+          const recoveryPath = path.join(directory, name);
+          try {
+            const state = await fs.lstat(recoveryPath);
+            return state.isFile() ? { path: recoveryPath, state } : null;
+          } catch {
+            return null;
+          }
+        }),
+      )).filter((item): item is NonNullable<typeof item> => item !== null)
+        .sort((left, right) => right.state.mtimeMs - left.state.mtimeMs);
+
+      let kept = 0;
+      let keptBytes = 0;
+      for (const item of active) {
+        const withinGrace = item.state.mtimeMs >= activeCutoff;
+        const withinCaps = kept < RECOVERY_ACTIVE_MAX_COUNT
+          && keptBytes + item.state.size <= RECOVERY_ACTIVE_MAX_BYTES;
+        if (withinGrace && withinCaps) {
+          kept++;
+          keptBytes += item.state.size;
+          continue;
         }
-      }));
+        try { await this.retireRecoveryFile(item.path, filePath); } catch {}
+      }
 
       const retiredNames = (await fs.readdir(directory)).filter((name) => retiredPattern.test(name));
       const retired = await Promise.all(retiredNames.map(async (name) => {

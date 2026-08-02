@@ -28,7 +28,7 @@ export const DEFAULT_FLUSH_RECENT_MESSAGES = 0;
  * mid-run on every attempt (#136). Configured values are honored verbatim,
  * including lower ones; `loadConfig` warns when a value below this is set.
  */
-export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 180000;
+export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 600000;
 export const DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS = 7;
 export const DEFAULT_FAILURE_INJECTION_MAX_ENTRIES = 5;
 

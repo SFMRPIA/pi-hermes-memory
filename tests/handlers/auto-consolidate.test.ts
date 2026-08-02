@@ -799,55 +799,63 @@ describe("MemoryStore auto-consolidation integration", () => {
     return store;
   }
 
-  it("add() surfaces the reason a failed auto-consolidation reported", async () => {
-    const store = await storeWithConsolidator("reason", async () => ({
-      consolidated: false,
-      error: "Consolidation subprocess was terminated (likely timeout or cancellation). Timeout: 180000ms.",
-    }));
+  it("add() accepts the entry and schedules background consolidation even when the consolidator reports failure", async () => {
+    let calls = 0;
+    const store = await storeWithConsolidator("reason", async () => {
+      calls++;
+      return { consolidated: false, error: "Consolidation subprocess was terminated (likely timeout or cancellation). Timeout: 600000ms." };
+    });
 
     const result = await store.add("memory", "b".repeat(20));
 
-    assert.ok(!result.success, "over-capacity add should still fail");
-    assert.ok(result.error!.startsWith("Memory at "), "original capacity error must be preserved");
-    assert.ok(
-      result.error!.includes("Auto-consolidation attempted but failed: Consolidation subprocess was terminated"),
-      `expected the consolidation reason to be appended, got: ${result.error}`,
-    );
+    // Async overflow path: the write succeeds immediately; the consolidation
+    // failure is a background concern, not a blocked, failed write.
+    assert.ok(result.success, "over-capacity add must succeed immediately");
+    assert.ok(result.message!.includes("background consolidation"), result.message);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls, 1, "the consolidator must still be invoked in the background");
   });
 
-  it("add() reports a reasonless consolidation failure instead of staying silent", async () => {
-    const store = await storeWithConsolidator("reasonless", async () => ({ consolidated: false }));
+  it("add() accepts the entry and schedules background consolidation on a reasonless consolidation failure", async () => {
+    let calls = 0;
+    const store = await storeWithConsolidator("reasonless", async () => {
+      calls++;
+      return { consolidated: false };
+    });
 
     const result = await store.add("memory", "b".repeat(20));
 
-    assert.ok(result.error!.includes("Auto-consolidation attempted but failed: no reason reported"), result.error);
+    assert.ok(result.success, "over-capacity add must succeed immediately");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls, 1, "the consolidator must still be invoked in the background");
   });
 
-  it("add() surfaces a consolidator that throws", async () => {
+  it("add() accepts the entry and schedules background consolidation when the consolidator throws", async () => {
+    let calls = 0;
     const store = await storeWithConsolidator("throws", async () => {
+      calls++;
       throw new Error("spawn ENOENT");
     });
 
     const result = await store.add("memory", "b".repeat(20));
 
-    assert.ok(!result.success, "a thrown consolidator must not surface as success");
-    assert.ok(result.error!.includes("consolidator threw"), result.error);
-    assert.ok(result.error!.includes("spawn ENOENT"), result.error);
+    assert.ok(result.success, "a thrown consolidator must not fail the write");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls, 1, "the consolidator must still be invoked in the background");
   });
 
-  it("add() distinguishes a consolidation that ran but freed nothing", async () => {
-    const store = await storeWithConsolidator("no-space", async () => ({ consolidated: true }));
+  it("add() accepts the entry and schedules background consolidation even when nothing was freed", async () => {
+    let calls = 0;
+    const store = await storeWithConsolidator("no-space", async () => {
+      calls++;
+      return { consolidated: true };
+    });
 
     const result = await store.add("memory", "b".repeat(20));
 
-    assert.ok(!result.success, "add should still fail when nothing was freed");
-    assert.ok(
-      result.error!.includes("Auto-consolidation ran but did not free enough space."),
-      result.error,
-    );
-    assert.ok(
-      !result.error!.includes("attempted but failed"),
-      "a successful-but-ineffective consolidation is not a consolidation failure",
-    );
+    assert.ok(result.success, "add succeeds immediately; there is no blocking retry");
+    assert.ok(!result.error, result.error ?? "");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(calls, 1, "the consolidator must still be invoked in the background");
   });
 });

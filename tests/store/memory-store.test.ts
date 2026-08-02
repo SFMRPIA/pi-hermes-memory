@@ -1357,6 +1357,26 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.match(await fs.readFile(activePath, "utf-8"), /late active descriptor write/);
     });
 
+    it("caps the number of active recovery files regardless of age", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      // 40 fresh recovery files — all within the grace period
+      for (let i = 0; i < 40; i++) {
+        const p = (pathStore as any).recoveryPathFor(memoryPath) as string;
+        await writeRaw(p, `${TEST_MARKER} burst ${i}`);
+      }
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} triggers recovery pruning`);
+
+      const remaining = (await fs.readdir(MEMORY_DIR))
+        .filter((name) => name.startsWith(`.${MEMORY_FILE}.recovery-`));
+      const retired = (await fs.readdir(MEMORY_DIR))
+        .filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
+      assert.equal(remaining.length, 32, "only the newest 32 snapshots stay active");
+      assert.ok(retired.length >= 8, `the excess snapshots must be retired, got ${retired.length}`);
+    });
+
     it("ignores generated-looking recovery symlinks during pruning", async (t) => {
       if (process.platform === "win32") {
         t.skip("symlink creation requires platform privileges");
