@@ -270,6 +270,56 @@ describe("triggerConsolidation", () => {
     assert.match(result.error!, /60000ms/);
   });
 
+  it("restores pre-run entries when the child fails after removing entries", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consolidate-rollback-"));
+    const store = new MemoryStore({
+      memoryMode: "legacy-inject",
+      memoryCharLimit: 2000,
+      userCharLimit: 2000,
+      projectCharLimit: 2000,
+      nudgeInterval: 10,
+      reviewEnabled: false,
+      flushOnCompact: false,
+      flushOnShutdown: false,
+      flushMinTurns: 6,
+      autoConsolidate: true,
+      correctionDetection: false,
+      failureInjectionEnabled: false,
+      failureInjectionMaxAgeDays: 7,
+      failureInjectionMaxEntries: 5,
+      nudgeToolCalls: 15,
+      consolidationTimeoutMs: 600000,
+      vaultPromoteThreshold: 0.67,
+      vaultDailyNotes: true,
+      memoryDir: dir,
+    } as any);
+    await store.loadFromDisk();
+    await store.add("memory", "Alpha stable fact");
+    await store.add("memory", "Beta important fact");
+
+    // Child that removes both entries via the store, then exits non-zero
+    // (simulates a watchdog kill mid-consolidation).
+    const failingPi = {
+      on: () => {},
+      exec: async () => {
+        await store.remove("memory", "Alpha stable fact");
+        await store.remove("memory", "Beta important fact");
+        return { code: 1, stdout: "", stderr: "child failed" };
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as any;
+
+    const result = await triggerConsolidation(failingPi, store, "memory");
+
+    assert.strictEqual(result.consolidated, false);
+    const remaining = store.getMemoryEntries();
+    assert.ok(remaining.some((e) => e.includes("Alpha stable fact")), "pre-run entry restored");
+    assert.ok(remaining.some((e) => e.includes("Beta important fact")), "pre-run entry restored");
+
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("returns { consolidated: false } when pi.exec throws", async () => {
     const crashPi = {
       on: () => {},

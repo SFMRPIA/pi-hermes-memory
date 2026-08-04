@@ -101,6 +101,31 @@ function describeConsolidationFailure(
   return `Consolidation process exited with code ${result.code}: ${stderr?.slice(0, 200) || "unknown error"}`;
 }
 
+/**
+ * Roll back a failed consolidation: re-add any pre-run entries the child
+ * removed before it died/failed, so a killed consolidation never leaves the
+ * store half-empty. Idempotent — store.add skips entries that still exist.
+ */
+async function restorePreRunEntries(
+  store: MemoryStore,
+  target: MemoryTarget,
+  entries: string[],
+): Promise<void> {
+  for (const entry of entries) {
+    if (!entry.trim()) continue;
+    try {
+      await store.add(target, entry);
+    } catch {
+      // Best-effort rollback; the recovery snapshots remain the final backstop.
+    }
+  }
+}
+
+/**
+ * Run one consolidation pass: child LLM merges entries via the memory tool.
+ * On failure (non-zero exit, timeout/kill, or exception) the pre-run entries
+ * are restored so a partial run cannot leave the store empty.
+ */
 export async function triggerConsolidation(
   pi: ExtensionAPI,
   store: MemoryStore,
@@ -179,11 +204,13 @@ export async function triggerConsolidation(
     if (result.code === 0) {
       return { consolidated: true };
     }
+    await restorePreRunEntries(store, target, entries);
     return {
       consolidated: false,
       error: describeConsolidationFailure(result, timeoutMs),
     };
   } catch (err) {
+    await restorePreRunEntries(store, target, entries);
     return {
       consolidated: false,
       error: `Consolidation failed: ${String(err).slice(0, 200)}`,
