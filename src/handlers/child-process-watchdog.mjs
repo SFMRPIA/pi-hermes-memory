@@ -14,6 +14,9 @@ const child = spawn(command, args, {
   stdio: ["ignore", "pipe", "pipe"],
 });
 
+const startedAt = Date.now();
+process.stderr.write(`[hermes-memory] watchdog started pid=${child.pid ?? "?"} timeout=${timeoutMs}ms at ${new Date().toISOString()}\n`);
+
 child.stdout?.pipe(process.stdout);
 child.stderr?.pipe(process.stderr);
 
@@ -49,7 +52,7 @@ function terminateTree() {
 
 const timeout = setTimeout(() => {
   timedOut = true;
-  process.stderr.write(`[pi-hermes-memory] child timed out after ${timeoutMs}ms; terminating process tree\n`);
+  process.stderr.write(`[hermes-memory] watchdog: child timed out after ${timeoutMs}ms (${Date.now() - startedAt}ms elapsed, pid=${child.pid ?? "?"}); terminating process tree\n`);
   terminateTree();
 }, timeoutMs);
 timeout.unref();

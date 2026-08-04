@@ -88,14 +88,21 @@ function labelForTarget(target: MemoryTarget, toolTarget: ToolMemoryTarget): str
 }
 
 function describeConsolidationFailure(
-  result: { code: number; stderr?: string; killed?: boolean },
+  result: { code: number; stdout?: string; stderr?: string; killed?: boolean },
   timeoutMs: number,
 ): string {
   const stderr = result.stderr?.trim();
   const terminated = result.killed || result.code === 124 || result.code === 143;
+  const tail = (s: string | undefined): string => s?.trim().slice(-500) ?? "";
 
   if (terminated) {
-    return `Consolidation subprocess was terminated (likely timeout or cancellation). Timeout: ${timeoutMs}ms. Raise consolidationTimeoutMs if consolidation legitimately needs longer.`;
+    const details = [
+      tail(result.stdout) ? `stdout tail: ${tail(result.stdout)}` : "",
+      tail(result.stderr) ? `stderr tail: ${tail(result.stderr)}` : "",
+    ]
+      .filter(Boolean)
+      .join(" | ");
+    return `Consolidation subprocess was terminated (likely timeout or cancellation). Timeout: ${timeoutMs}ms. Raise consolidationTimeoutMs if consolidation legitimately needs longer.${details ? ` Child output: ${details}` : ""}`;
   }
 
   return `Consolidation process exited with code ${result.code}: ${stderr?.slice(0, 200) || "unknown error"}`;
@@ -143,6 +150,10 @@ export async function triggerConsolidation(
   const currentContent = entries.join(ENTRY_DELIMITER);
   const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
 
+  console.info(
+    `[hermes-memory] consolidate start target=${toolTarget} entries=${entries.length} chars=${currentContent.length} timeout=${timeoutMs} transport=${directCtx && usesDirectTransport(llmConfig) ? "direct" : "subprocess"} model=${llmConfig.llmModelOverride?.trim() || "(default)"} thinking=${llmConfig.llmThinkingOverride ?? "(inherit)"} ts=${new Date().toISOString()}`,
+  );
+
   if (directCtx && usesDirectTransport(llmConfig)) {
     try {
       const directResult = await runDirect(
@@ -185,6 +196,7 @@ export async function triggerConsolidation(
   ].join("\n");
 
   let lock: ConsolidationLock | null = null;
+  const runStartedAt = Date.now();
 
   try {
     lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
@@ -201,16 +213,23 @@ export async function triggerConsolidation(
       retryWithoutOverrides: true,
     }) as { code: number; stdout?: string; stderr?: string; killed?: boolean };
 
+    const elapsedMs = Date.now() - runStartedAt;
+    console.info(
+      `[hermes-memory] consolidate child done target=${toolTarget} code=${result.code} killed=${result.killed ?? false} elapsed=${elapsedMs}ms ts=${new Date().toISOString()}`,
+    );
+
     if (result.code === 0) {
       return { consolidated: true };
     }
     await restorePreRunEntries(store, target, entries);
+    console.warn(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget}`);
     return {
       consolidated: false,
       error: describeConsolidationFailure(result, timeoutMs),
     };
   } catch (err) {
     await restorePreRunEntries(store, target, entries);
+    console.warn(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget} (exception)`);
     return {
       consolidated: false,
       error: `Consolidation failed: ${String(err).slice(0, 200)}`,

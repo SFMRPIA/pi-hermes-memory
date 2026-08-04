@@ -403,13 +403,21 @@ export async function execChildPrompt(
   if (options.signal?.aborted) requestCancellation();
 
   try {
+    let attempt = "primary";
     try {
       const invocation = resolveWatchedChildPiInvocation(
         resolveChildPiInvocation(buildChildPiPromptArgs(promptReference, config)),
         options.timeoutMs,
         cancellationPath,
       );
+      console.info(
+        `[hermes-memory] child spawn attempt=${attempt} cmd=${invocation.command} args=${invocation.args.join(" ")} timeout=${options.timeoutMs} ts=${new Date().toISOString()}`,
+      );
+      const childStartedAt = Date.now();
       const result = await pi.exec(invocation.command, invocation.args, execOptions) as PiExecResult;
+      console.info(
+        `[hermes-memory] child exit attempt=${attempt} code=${result.code} killed=${result.killed ?? false} elapsed=${Date.now() - childStartedAt}ms ts=${new Date().toISOString()}`,
+      );
       if (
         result.code === 0 ||
         !options.retryWithoutOverrides ||
@@ -418,6 +426,9 @@ export async function execChildPrompt(
       ) {
         return result;
       }
+      console.warn(
+        `[hermes-memory] child attempt=${attempt} failed with override-related error (code ${result.code}); retrying without model/thinking overrides`,
+      );
     } catch (error) {
       if (
         !options.retryWithoutOverrides ||
@@ -426,14 +437,26 @@ export async function execChildPrompt(
       ) {
         throw error;
       }
+      console.warn(
+        `[hermes-memory] child attempt=${attempt} threw override-related error (${String(error).slice(0, 200)}); retrying without model/thinking overrides`,
+      );
     }
 
+    attempt = "retry-without-overrides";
     const retryInvocation = resolveWatchedChildPiInvocation(
       resolveChildPiInvocation(basePromptArgs(promptReference, config)),
       options.timeoutMs,
       cancellationPath,
     );
-    return await pi.exec(retryInvocation.command, retryInvocation.args, execOptions) as PiExecResult;
+    console.info(
+      `[hermes-memory] child spawn attempt=${attempt} cmd=${retryInvocation.command} args=${retryInvocation.args.join(" ")} timeout=${options.timeoutMs} ts=${new Date().toISOString()}`,
+    );
+    const retryStartedAt = Date.now();
+    const retryResult = await pi.exec(retryInvocation.command, retryInvocation.args, execOptions) as PiExecResult;
+    console.info(
+      `[hermes-memory] child exit attempt=${attempt} code=${retryResult.code} killed=${retryResult.killed ?? false} elapsed=${Date.now() - retryStartedAt}ms ts=${new Date().toISOString()}`,
+    );
+    return retryResult;
   } finally {
     options.signal?.removeEventListener("abort", requestCancellation);
     try {
