@@ -31,6 +31,55 @@ export interface PromotionResult {
 
 type Target = "memory" | "user" | "failure";
 
+/** Vault files whose existing section titles are shown to the promotion child. */
+const VAULT_TITLE_FILES = [
+  "System/Assistant/context.md",
+  "System/Assistant/preferences.md",
+  "System/Assistant/environment.md",
+  "System/Assistant/logs/issues-fixes-log.md",
+];
+
+/**
+ * Merge promoted content into an existing vault file.
+ *
+ * If the new content starts with a `## Section` header and the file already has
+ * a section with the same normalized title, that section is REPLACED (up to the
+ * next `## ` header or EOF). Otherwise the content is appended. This prevents
+ * duplicate sections when the same topic is promoted again later.
+ */
+export function mergeVaultContent(existing: string, content: string): string {
+  const norm = content.trimEnd() + "\n";
+  const header = content.match(/^##\s+(.+)$/m);
+  if (!header) {
+    return existing.trimEnd() ? existing.trimEnd() + "\n\n" + norm : norm;
+  }
+
+  const title = header[1].trim().toLowerCase().replace(/\s+/g, " ");
+  const lines = existing.split("\n");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^##\s+(.+)$/);
+    if (m && m[1].trim().toLowerCase().replace(/\s+/g, " ") === title) {
+      start = i;
+      break;
+    }
+  }
+  if (start === -1) {
+    return existing.trimEnd() ? existing.trimEnd() + "\n\n" + norm : norm;
+  }
+
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) {
+      end = i;
+      break;
+    }
+  }
+  const head = lines.slice(0, start).join("\n").trimEnd();
+  const tail = lines.slice(end).join("\n").trimStart();
+  return (head ? head + "\n" : "") + norm + (tail ? tail : "");
+}
+
 /** One pending promotion per store target (fire-and-forget dedupe). */
 const pending = new Set<string>();
 
@@ -105,11 +154,26 @@ export async function runVaultPromotion(
   const entries = entriesFor(store, target);
   if (entries.length === 0) return { promoted: 0, removed: 0 };
 
+  // Collect existing vault section titles so the child can reuse titles and
+  // avoid creating duplicate sections for topics already in the vault.
+  const existingTitles: string[] = [];
+  for (const rel of VAULT_TITLE_FILES) {
+    const abs = path.join(vault, rel);
+    const text = await fs.readFile(abs, "utf-8").catch(() => "");
+    const titles = text.split("\n").filter((l) => /^##\s+/.test(l)).map((l) => l.trim());
+    if (titles.length) {
+      existingTitles.push(rel + ":\n" + titles.join("\n"));
+    }
+  }
+
   const prompt = [
     PROMOTION_PROMPT,
     "",
     `--- Current ${target} entries (project: ${project}) ---`,
     entries.join(ENTRY_DELIMITER) || "(empty)",
+    "",
+    "--- Existing vault sections (do NOT create duplicates; reuse exact titles when updating) ---",
+    existingTitles.join("\n\n") || "(vault empty)",
   ].join("\n");
 
   let result: { code: number; stdout?: string; stderr?: string };
@@ -156,7 +220,7 @@ export async function runVaultPromotion(
     try {
       await fs.mkdir(path.dirname(abs), { recursive: true });
       const existing = await fs.readFile(abs, "utf-8").catch(() => "");
-      await fs.writeFile(abs, existing ? existing.replace(/\s*$/, "\n") + "\n" + item.content : item.content, "utf-8");
+      await fs.writeFile(abs, existing ? mergeVaultContent(existing, item.content) : item.content, "utf-8");
       promotedCount++;
     } catch {
       // Skip this file; its entries must NOT be removed below.

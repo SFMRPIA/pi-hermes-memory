@@ -251,7 +251,7 @@ The vault living files under System/Assistant/ hold stable reference material:
 
 Rules:
 - Select entries that are STABLE reference material (configs, conventions, known issues, user preferences, environment facts). Leave transient session state alone.
-- For each promoted entry, write a concise, self-contained markdown section for the most fitting vault file. The file may already exist with other sections — your content will be appended.
+- For each promoted entry, write a concise, self-contained markdown section for the most fitting vault file. The vault files already have sections — their titles are listed at the end of this prompt. Do NOT create duplicate sections: if a topic you want to promote already has a section there, either skip it, or return the UPDATED section REUSING THE EXACT SAME TITLE (same wording and case) so it replaces the old one. Only brand-new topics get new titles.
 - Reply with STRICT JSON only — no markdown fences, no prose, nothing else:
 {"promote":[{"file":"System/Assistant/context.md","content":"## Section Title\\n- fact\\n"}, ...],"remove":["<exact full entry text to remove from hot memory>", ...]}
 - "remove" must contain the FULL original entry text (exactly as shown above, including any metadata comments) for every entry you promoted. Entries not promoted must NOT appear in "remove".

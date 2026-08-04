@@ -17,7 +17,7 @@ import {
   DEFAULT_USER_CHAR_LIMIT,
 } from "../../src/constants.js";
 import type { MemoryConfig } from "../../src/types.js";
-import { runVaultPromotion, setupVaultPromotion } from "../../src/handlers/vault-promotion.js";
+import { runVaultPromotion, setupVaultPromotion, mergeVaultContent } from "../../src/handlers/vault-promotion.js";
 
 let MEMORY_DIR = "";
 let VAULT = "";
@@ -184,5 +184,51 @@ describe("setupVaultPromotion", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     assert.equal(called, 0, "no promotion below the threshold");
+  });
+});
+
+describe("mergeVaultContent", () => {
+  it("replaces a section with the same normalized title", () => {
+    const existing = "Intro line\n## Foo Bar\n- old fact\n- old detail\n## Baz\n- keep me\n";
+    const updated = mergeVaultContent(existing, "## Foo Bar\n- new fact\n");
+    assert.equal(updated, "Intro line\n## Foo Bar\n- new fact\n## Baz\n- keep me\n");
+    assert.equal((updated.match(/## Foo Bar/g) ?? []).length, 1, "no duplicate section");
+  });
+
+  it("appends when the title does not exist yet", () => {
+    const existing = "## Foo\n- fact\n";
+    const updated = mergeVaultContent(existing, "## Bar\n- other\n");
+    assert.equal(updated, "## Foo\n- fact\n\n## Bar\n- other\n");
+    assert.equal((updated.match(/## Bar/g) ?? []).length, 1);
+  });
+
+  it("appends plain content without a header", () => {
+    const existing = "## Foo\n- fact\n";
+    const updated = mergeVaultContent(existing, "- bare bullet\n");
+    assert.equal(updated, "## Foo\n- fact\n\n- bare bullet\n");
+  });
+
+  it("handles an empty existing file", () => {
+    const updated = mergeVaultContent("", "## Foo\n- fact\n");
+    assert.equal(updated, "## Foo\n- fact\n");
+  });
+});
+
+describe("promotion dedupe end-to-end", () => {
+  it("promoting the same topic twice keeps a single section", async () => {
+    const config = makeConfig({ vaultPath: VAULT });
+    await store.add("memory", "Alpha stable fact about the environment");
+    const plan = JSON.stringify({
+      promote: [{ file: "System/Assistant/context.md", content: "## Topic X\n- fact 1\n" }],
+      remove: [],
+    });
+
+    const r1 = await runVaultPromotion(fakePi(plan), store, "memory", config);
+    const r2 = await runVaultPromotion(fakePi(plan), store, "memory", config);
+
+    assert.equal(r1.promoted, 1);
+    assert.equal(r2.promoted, 1);
+    const vaultContent = await fs.readFile(path.join(VAULT, "System/Assistant/context.md"), "utf-8");
+    assert.equal((vaultContent.match(/## Topic X/g) ?? []).length, 1, "one section despite two promotions");
   });
 });
