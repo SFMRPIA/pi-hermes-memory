@@ -28,6 +28,7 @@ import {
 } from "../constants.js";
 import type { ConsolidationResult, MemoryConfig } from "../types.js";
 import { AGENT_ROOT } from "../paths.js";
+import { appendConsolidationLog } from "./consolidation-log.js";
 import { execChildPrompt } from "./pi-child-process.js";
 import { runDirectMemoryCompletion, usesDirectTransport } from "./review-memory-ops.js";
 import { AtomicLockCoordinator } from "../store/atomic-lock-coordinator.js";
@@ -150,7 +151,7 @@ export async function triggerConsolidation(
   const currentContent = entries.join(ENTRY_DELIMITER);
   const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
 
-  console.info(
+  appendConsolidationLog(
     `[hermes-memory] consolidate start target=${toolTarget} entries=${entries.length} chars=${currentContent.length} timeout=${timeoutMs} transport=${directCtx && usesDirectTransport(llmConfig) ? "direct" : "subprocess"} model=${llmConfig.llmModelOverride?.trim() || "(default)"} thinking=${llmConfig.llmThinkingOverride ?? "(inherit)"} ts=${new Date().toISOString()}`,
   );
 
@@ -214,7 +215,7 @@ export async function triggerConsolidation(
     }) as { code: number; stdout?: string; stderr?: string; killed?: boolean };
 
     const elapsedMs = Date.now() - runStartedAt;
-    console.info(
+    appendConsolidationLog(
       `[hermes-memory] consolidate child done target=${toolTarget} code=${result.code} killed=${result.killed ?? false} elapsed=${elapsedMs}ms ts=${new Date().toISOString()}`,
     );
 
@@ -222,14 +223,14 @@ export async function triggerConsolidation(
       return { consolidated: true };
     }
     await restorePreRunEntries(store, target, entries);
-    console.warn(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget}`);
+    appendConsolidationLog(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget}`);
     return {
       consolidated: false,
       error: describeConsolidationFailure(result, timeoutMs),
     };
   } catch (err) {
     await restorePreRunEntries(store, target, entries);
-    console.warn(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget} (exception)`);
+    appendConsolidationLog(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget} (exception)`);
     return {
       consolidated: false,
       error: `Consolidation failed: ${String(err).slice(0, 200)}`,

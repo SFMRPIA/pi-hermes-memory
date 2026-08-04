@@ -1,5 +1,19 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+// Diagnostics go to the consolidation log file, not the terminal (the user
+// wants the console clean; failures are greppable in the file).
+const logFile = path.join(os.homedir(), ".pi", "agent", "pi-hermes-memory", "logs", "consolidation.log");
+function log(line) {
+  try {
+    mkdirSync(path.dirname(logFile), { recursive: true });
+    appendFileSync(logFile, `${line}\n`);
+  } catch {
+    // Logging must never break the watchdog.
+  }
+}
 
 const [timeoutValue, cancellationPath, command, ...args] = process.argv.slice(2);
 const timeoutMs = Number(timeoutValue);
@@ -15,7 +29,7 @@ const child = spawn(command, args, {
 });
 
 const startedAt = Date.now();
-process.stderr.write(`[hermes-memory] watchdog started pid=${child.pid ?? "?"} timeout=${timeoutMs}ms at ${new Date().toISOString()}\n`);
+log(`[hermes-memory] watchdog started pid=${child.pid ?? "?"} timeout=${timeoutMs}ms at ${new Date().toISOString()}`);
 
 child.stdout?.pipe(process.stdout);
 child.stderr?.pipe(process.stderr);
@@ -52,7 +66,7 @@ function terminateTree() {
 
 const timeout = setTimeout(() => {
   timedOut = true;
-  process.stderr.write(`[hermes-memory] watchdog: child timed out after ${timeoutMs}ms (${Date.now() - startedAt}ms elapsed, pid=${child.pid ?? "?"}); terminating process tree\n`);
+  log(`[hermes-memory] watchdog: child timed out after ${timeoutMs}ms (${Date.now() - startedAt}ms elapsed, pid=${child.pid ?? "?"}); terminating process tree`);
   terminateTree();
 }, timeoutMs);
 timeout.unref();
@@ -60,7 +74,7 @@ timeout.unref();
 const cancellationPoll = cancellationPath === "-" ? undefined : setInterval(() => {
   if (!existsSync(cancellationPath)) return;
   cancelled = true;
-  process.stderr.write("[pi-hermes-memory] child cancellation requested; terminating process tree\n");
+  log("[pi-hermes-memory] child cancellation requested; terminating process tree");
   terminateTree();
 }, 25);
 cancellationPoll?.unref();

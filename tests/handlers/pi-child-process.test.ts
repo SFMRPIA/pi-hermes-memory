@@ -391,27 +391,36 @@ describe("execChildPrompt", () => {
   });
 
   it("hard-kills a child that ignores graceful timeout termination", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-watchdog-hardkill-"));
     const watchdogPath = fileURLToPath(
       new URL("../../src/handlers/child-process-watchdog.mjs", import.meta.url),
     );
     const startedAt = Date.now();
-    const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-      const child = spawn(process.execPath, [
-        watchdogPath,
-        "100",
-        "-",
-        process.execPath,
-        "-e",
-        "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
-      ], { stdio: ["ignore", "ignore", "pipe"] });
-      let stderr = "";
-      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-      child.on("close", (code) => resolve({ code, stderr }));
-    });
+    try {
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, [
+          watchdogPath,
+          "100",
+          "-",
+          process.execPath,
+          "-e",
+          "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
+        ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, USERPROFILE: directory } });
+        let stderr = "";
+        child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+        child.on("close", (code) => resolve({ code, stderr }));
+      });
 
-    assert.equal(result.code, 124);
-    assert.match(result.stderr, /timed out after 100ms/i);
-    assert.ok(Date.now() - startedAt < 3000, "watchdog must enforce a bounded hard stop");
+      assert.equal(result.code, 124);
+      const log = await fs.readFile(
+        path.join(directory, ".pi", "agent", "pi-hermes-memory", "logs", "consolidation.log"),
+        "utf-8",
+      );
+      assert.match(log, /timed out after 100ms/i);
+      assert.ok(Date.now() - startedAt < 3000, "watchdog must enforce a bounded hard stop");
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("terminates the child tree when its cancellation marker appears", async () => {
@@ -430,7 +439,7 @@ describe("execChildPrompt", () => {
           process.execPath,
           "-e",
           "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
-        ], { stdio: ["ignore", "ignore", "pipe"] });
+        ], { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, USERPROFILE: directory } });
         let stderr = "";
         child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
         child.on("close", (code) => resolve({ code, stderr }));
@@ -438,7 +447,11 @@ describe("execChildPrompt", () => {
       });
 
       assert.equal(result.code, 143);
-      assert.match(result.stderr, /child cancellation requested/i);
+      const log = await fs.readFile(
+        path.join(directory, ".pi", "agent", "pi-hermes-memory", "logs", "consolidation.log"),
+        "utf-8",
+      );
+      assert.match(log, /child cancellation requested/i);
       assert.ok(Date.now() - startedAt < 3000, "watchdog cancellation must be bounded");
     } finally {
       await fs.rm(directory, { recursive: true, force: true });

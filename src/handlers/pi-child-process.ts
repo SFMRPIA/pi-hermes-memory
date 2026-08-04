@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { MemoryConfig, ThinkingLevel } from "../types.js";
 import { AGENT_ROOT } from "../paths.js";
+import { appendConsolidationLog } from "./consolidation-log.js";
 
 type ChildLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride" | "childExtensionPaths">;
 
@@ -410,12 +411,12 @@ export async function execChildPrompt(
         options.timeoutMs,
         cancellationPath,
       );
-      console.info(
+      appendConsolidationLog(
         `[hermes-memory] child spawn attempt=${attempt} cmd=${invocation.command} args=${invocation.args.join(" ")} timeout=${options.timeoutMs} ts=${new Date().toISOString()}`,
       );
       const childStartedAt = Date.now();
       const result = await pi.exec(invocation.command, invocation.args, execOptions) as PiExecResult;
-      console.info(
+      appendConsolidationLog(
         `[hermes-memory] child exit attempt=${attempt} code=${result.code} killed=${result.killed ?? false} elapsed=${Date.now() - childStartedAt}ms ts=${new Date().toISOString()}`,
       );
       if (
@@ -426,7 +427,7 @@ export async function execChildPrompt(
       ) {
         return result;
       }
-      console.warn(
+      appendConsolidationLog(
         `[hermes-memory] child attempt=${attempt} failed with override-related error (code ${result.code}); retrying without model/thinking overrides`,
       );
     } catch (error) {
@@ -437,7 +438,7 @@ export async function execChildPrompt(
       ) {
         throw error;
       }
-      console.warn(
+      appendConsolidationLog(
         `[hermes-memory] child attempt=${attempt} threw override-related error (${String(error).slice(0, 200)}); retrying without model/thinking overrides`,
       );
     }
@@ -448,12 +449,12 @@ export async function execChildPrompt(
       options.timeoutMs,
       cancellationPath,
     );
-    console.info(
+    appendConsolidationLog(
       `[hermes-memory] child spawn attempt=${attempt} cmd=${retryInvocation.command} args=${retryInvocation.args.join(" ")} timeout=${options.timeoutMs} ts=${new Date().toISOString()}`,
     );
     const retryStartedAt = Date.now();
     const retryResult = await pi.exec(retryInvocation.command, retryInvocation.args, execOptions) as PiExecResult;
-    console.info(
+    appendConsolidationLog(
       `[hermes-memory] child exit attempt=${attempt} code=${retryResult.code} killed=${retryResult.killed ?? false} elapsed=${Date.now() - retryStartedAt}ms ts=${new Date().toISOString()}`,
     );
     return retryResult;
