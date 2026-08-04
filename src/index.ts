@@ -44,6 +44,7 @@ import { setupBackgroundReview } from "./handlers/background-review.js";
 import { setupSessionFlush } from "./handlers/session-flush.js";
 import { registerInsightsCommand } from "./handlers/insights.js";
 import { triggerConsolidation, registerConsolidateCommand } from "./handlers/auto-consolidate.js";
+import { appendConsolidationLog } from "./handlers/consolidation-log.js";
 import { setupCorrectionDetector } from "./handlers/correction-detector.js";
 import { registerSkillsCommand } from "./handlers/skills-command.js";
 import { registerInterviewCommand } from "./handlers/interview.js";
@@ -237,13 +238,20 @@ export default function (pi: ExtensionAPI) {
   // ── 7. Setup auto-consolidation (inject consolidator into stores) ──
   // A failed auto-consolidation is otherwise invisible outside the tool result,
   // so log the reason for whoever is watching the session (#135).
+  //
+  // Auto runs are serialized (one at a time, any target): concurrent child
+  // processes contend for the model API and one can stall for the full timeout
+  // with zero output (observed: 3 parallel runs, 1 hung 600s). Manual
+  // /memory-consolidate and tests call triggerConsolidation directly and keep
+  // their per-target lock semantics.
+  let autoConsolidationTail: Promise<unknown> = Promise.resolve();
   const runAutoConsolidation = async (
     target: "memory" | "user" | "failure",
     targetStore: MemoryStore,
     toolTarget: "memory" | "user" | "failure" | "project",
     signal?: AbortSignal,
   ) => {
-    const result = await triggerConsolidation(
+    const run = () => triggerConsolidation(
       pi,
       targetStore,
       target,
@@ -252,8 +260,15 @@ export default function (pi: ExtensionAPI) {
       toolTarget,
       config,
     );
+    const previous = autoConsolidationTail;
+    let release!: () => void;
+    autoConsolidationTail = new Promise<void>((resolve) => { release = resolve; });
+    const result = await previous.then(run).finally(release);
     if (!result.consolidated) {
-      console.warn(`⚠️ Auto-consolidation failed for '${toolTarget}': ${result.error ?? "no reason reported"}`);
+      // Failures go to the consolidation log file, not the terminal (the user
+      // asked for a clean console; the retry/self-healing path already handles
+      // recovery, and the log keeps the details greppable).
+      appendConsolidationLog(`[hermes-memory] auto-consolidation failed for '${toolTarget}': ${result.error ?? "no reason reported"}`);
     }
     return result;
   };
