@@ -35,6 +35,10 @@ export const DEFAULT_FAILURE_INJECTION_MAX_ENTRIES = 5;
 // ─── Vault (Obsidian-style long-term memory) ───
 export const DEFAULT_VAULT_PROMOTE_THRESHOLD = 0.67;
 export const DEFAULT_VAULT_DAILY_NOTES = true;
+export const DEFAULT_VAULT_RETENTION_DAYS = 90;
+
+// ─── Memory search ranking ───
+export const DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT = 0.4;
 
 // ─── File names ───
 export const MEMORY_FILE = "MEMORY.md";

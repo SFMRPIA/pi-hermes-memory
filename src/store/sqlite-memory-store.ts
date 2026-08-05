@@ -7,6 +7,7 @@ import {
   normalizeNaturalLanguageFts5Query,
 } from './fts-query.js';
 import { normalizeMemoryLookupText } from './memory-lookup.js';
+import { DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT } from '../constants.js';
 import type { MemoryCategory } from '../types.js';
 
 const MEMORY_SELECT_COLUMNS = `
@@ -685,14 +686,22 @@ export function removeExactSyncedMemories(
 export function searchMemories(
   dbManager: DatabaseManager,
   query: string,
-  options: { project?: string; target?: string; category?: MemoryCategory; limit?: number } = {}
+  options: {
+    project?: string;
+    target?: string;
+    category?: MemoryCategory;
+    limit?: number;
+    /** 0 = pure FTS relevance, 1 = pure recency. Default: DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT */
+    recencyWeight?: number;
+  } = {}
 ): SqliteMemoryEntry[] {
   if (query.trim().length === 0) {
     return [];
   }
 
   const db = dbManager.getDb();
-  const { project, target, category, limit = 10 } = options;
+  const { project, target, category, limit = 10, recencyWeight = DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT } = options;
+  const weight = Math.min(1, Math.max(0, recencyWeight));
 
   const conditions: string[] = [];
   const params: unknown[] = [];
@@ -708,9 +717,6 @@ export function searchMemories(
   const runSearch = (matchQuery: string): SqliteMemoryEntry[] => {
     const conditions: string[] = [];
     const params: unknown[] = [];
-
-    conditions.push('m.id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?)');
-    params.push(matchQuery);
 
     if (project !== undefined) {
       if (project === null) {
@@ -731,18 +737,41 @@ export function searchMemories(
       params.push(category);
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const whereClause = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
 
-    const sql = `
-      SELECT ${MEMORY_SELECT_COLUMNS}
-      FROM memories m
-      ${whereClause}
-      ORDER BY m.last_referenced DESC
-      LIMIT ?
-    `;
-
+    // Rank by a blend of FTS5 relevance (bm25) and recency of last reference.
+    // bm25 returns negative scores where MORE negative = better match. Raw
+    // magnitudes shrink with corpus size, so relevance is max-normalized
+    // within the matched set (best match of the batch = 1.0) — this keeps the
+    // blend meaningful whether the store holds 2 entries or 2,000. bm25() is
+    // an FTS5 auxiliary function and cannot appear in a subquery or an
+    // aggregate, so the best score is fetched by a separate top-level query
+    // (ordered, limited to 1) and bound as a parameter. Recency uses a 30-day
+    // half-life on days since last reference, falling back to creation date,
+    // then a neutral ancient date. weight = memorySearchRecencyWeight; ties
+    // break toward the fresher entry.
     try {
-      const rows = db.prepare(sql).all(...params, limit) as Array<{
+      const maxRow = db.prepare(
+        "SELECT ABS(bm25(memory_fts)) AS max_score FROM memory_fts"
+          + " WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts) LIMIT 1",
+      ).get(matchQuery) as { max_score: number | null } | undefined;
+      const maxScore = maxRow?.max_score ?? 0;
+
+      const sql = `
+        SELECT m.id, m.project, m.target, m.category, m.content, m.failure_reason,
+               m.tool_state, m.corrected_to, m.created, m.last_referenced
+        FROM memories m
+        JOIN memory_fts f ON f.rowid = m.id
+        WHERE memory_fts MATCH ?
+        ${whereClause}
+        ORDER BY (
+          (1.0 - ?) * COALESCE(ABS(bm25(memory_fts)) / NULLIF(?, 0), 1.0)
+          + ? * (1.0 / (1.0 + MAX(0, julianday('now') - julianday(COALESCE(NULLIF(m.last_referenced, ''), m.created, '1970-01-01'))) / 30.0))
+        ) DESC, m.last_referenced DESC
+        LIMIT ?
+      `;
+
+      const rows = db.prepare(sql).all(matchQuery, ...params, weight, maxScore, weight, limit) as Array<{
         id: number;
         project: string | null;
         target: string;

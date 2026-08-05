@@ -16,6 +16,8 @@ import {
   DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
   DEFAULT_VAULT_PROMOTE_THRESHOLD,
   DEFAULT_VAULT_DAILY_NOTES,
+  DEFAULT_VAULT_RETENTION_DAYS,
+  DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT,
 } from "./constants.js";
 import { AGENT_ROOT, normalizeConfiguredMemoryDir, normalizeProjectsMemoryDir } from "./paths.js";
 
@@ -61,10 +63,12 @@ const DEFAULT_CONFIG: MemoryConfig = {
   failureInjectionMaxAgeDays: DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   failureInjectionMaxEntries: DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
   consolidationTimeoutMs: DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  standingInstructionsEnabled: true,
+  memorySearchRecencyWeight: DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT,
   vaultPromoteThreshold: DEFAULT_VAULT_PROMOTE_THRESHOLD,
   vaultDailyNotes: DEFAULT_VAULT_DAILY_NOTES,
+  vaultRetentionDays: DEFAULT_VAULT_RETENTION_DAYS,
   nudgeToolCalls: DEFAULT_NUDGE_TOOL_CALLS,
-  standingInstructionsEnabled: true,
   projectsMemoryDir: DEFAULT_PROJECTS_MEMORY_DIR,
   sessionSearch: { variant: "legacy" },
 };
@@ -134,6 +138,13 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       if (typeof parsed.failureInjectionMaxEntries === "number") config.failureInjectionMaxEntries = parsed.failureInjectionMaxEntries;
       if (typeof parsed.nudgeToolCalls === "number") config.nudgeToolCalls = parsed.nudgeToolCalls;
       if (typeof parsed.standingInstructionsEnabled === "boolean") config.standingInstructionsEnabled = parsed.standingInstructionsEnabled;
+      if (typeof parsed.memorySearchRecencyWeight === "number"
+        && parsed.memorySearchRecencyWeight >= 0 && parsed.memorySearchRecencyWeight <= 1) {
+        config.memorySearchRecencyWeight = parsed.memorySearchRecencyWeight;
+      }
+      if (typeof parsed.vaultRetentionDays === "number" && parsed.vaultRetentionDays > 0) {
+        config.vaultRetentionDays = parsed.vaultRetentionDays;
+      }
       if (typeof parsed.projectCharLimit === "number") config.projectCharLimit = parsed.projectCharLimit;
       if (typeof parsed.memoryDir === "string") {
         const normalizedMemoryDir = normalizeConfiguredMemoryDir(parsed.memoryDir);

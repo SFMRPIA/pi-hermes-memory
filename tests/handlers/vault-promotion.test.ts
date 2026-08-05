@@ -212,6 +212,28 @@ describe("mergeVaultContent", () => {
     const updated = mergeVaultContent("", "## Foo\n- fact\n");
     assert.equal(updated, "## Foo\n- fact\n");
   });
+
+  it("stamps a new section with the updated date when one is given", () => {
+    const updated = mergeVaultContent("", "## Foo\n- fact\n", "2026-08-03");
+    assert.equal(updated, "## Foo\n- fact\n<!-- updated=2026-08-03 -->\n");
+  });
+
+  it("re-stamps a replaced section in place", () => {
+    const existing = "## Foo\n- old fact\n## Baz\n- keep me\n";
+    const updated = mergeVaultContent(existing, "## Foo\n- new fact\n", "2026-08-03");
+    assert.equal(updated, "## Foo\n- new fact\n<!-- updated=2026-08-03 -->\n## Baz\n- keep me\n");
+  });
+
+  it("stamps an appended section at the end of the file", () => {
+    const existing = "## Foo\n- fact\n## Baz\n- keep me\n";
+    const updated = mergeVaultContent(existing, "## Bar\n- other\n", "2026-08-03");
+    assert.equal(updated, "## Foo\n- fact\n## Baz\n- keep me\n\n## Bar\n- other\n<!-- updated=2026-08-03 -->\n");
+  });
+
+  it("never stamps headerless log content", () => {
+    const updated = mergeVaultContent("## Foo\n- fact\n", "- bare bullet\n", "2026-08-03");
+    assert.equal(updated, "## Foo\n- fact\n\n- bare bullet\n");
+  });
 });
 
 describe("promotion dedupe end-to-end", () => {

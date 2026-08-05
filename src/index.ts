@@ -39,7 +39,8 @@ import { registerMemorySearchTool } from "./tools/memory-search-tool.js";
 import { registerVaultLogTool } from "./tools/vault-log.js";
 import { registerVaultSearchTool } from "./tools/vault-search.js";
 import { setupVaultPromotion } from "./handlers/vault-promotion.js";
-import { ensureDailyNote, vaultConfigured } from "./handlers/vault-notes.js";
+import { runVaultAging } from "./handlers/vault-aging.js";
+import { ensureDailyNote, vaultConfigured, todayStr } from "./handlers/vault-notes.js";
 import { setupBackgroundReview } from "./handlers/background-review.js";
 import { setupSessionFlush } from "./handlers/session-flush.js";
 import { registerInsightsCommand } from "./handlers/insights.js";
@@ -230,6 +231,19 @@ export default function (pi: ExtensionAPI) {
         /* ignore */
       }
     }
+    // Vault aging — once per day, non-destructive, never blocks session start.
+    if (vaultConfigured(config.vaultPath)) {
+      try {
+        const markerPath = path.join(config.vaultPath, "System", ".aging-last-run");
+        const lastRun = await fs.promises.readFile(markerPath, "utf-8").catch(() => "");
+        if (lastRun !== todayStr()) {
+          await runVaultAging(config.vaultPath, config.vaultRetentionDays);
+          await fs.promises.writeFile(markerPath, todayStr(), "utf-8");
+        }
+      } catch {
+        /* ignore */
+      }
+    }
   });
 
   // ── 4. Register the skill tool ──
@@ -312,7 +326,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── 11. SQLite session search + extended memory ──
   registerSessionSearchTool(pi, dbManager, config.sessionSearch ?? { variant: "legacy" });
-  registerMemorySearchTool(pi, dbManager);
+  registerMemorySearchTool(pi, dbManager, config.memorySearchRecencyWeight);
   registerIndexSessionsCommand(pi);
 
   // ── 12. Auto-index session on shutdown ──

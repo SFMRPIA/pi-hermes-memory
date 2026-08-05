@@ -21,7 +21,7 @@ import { MemoryStore } from "../store/memory-store.js";
 import { PROMOTION_PROMPT, ENTRY_DELIMITER, DEFAULT_VAULT_PROMOTE_THRESHOLD } from "../constants.js";
 import type { MemoryConfig } from "../types.js";
 import { execChildPrompt } from "./pi-child-process.js";
-import { ensureVault, vaultConfigured } from "./vault-notes.js";
+import { ensureVault, vaultConfigured, todayStr } from "./vault-notes.js";
 
 export interface PromotionResult {
   promoted: number;
@@ -46,10 +46,16 @@ const VAULT_TITLE_FILES = [
  * a section with the same normalized title, that section is REPLACED (up to the
  * next `## ` header or EOF). Otherwise the content is appended. This prevents
  * duplicate sections when the same topic is promoted again later.
+ *
+ * When `updated` (YYYY-MM-DD) is given and the content is a `## ` section, the
+ * merged section is stamped with `<!-- updated=... -->` so vault aging can
+ * prove how fresh a section is. Log-style appends without a section header are
+ * never stamped.
  */
-export function mergeVaultContent(existing: string, content: string): string {
+export function mergeVaultContent(existing: string, content: string, updated?: string): string {
   const norm = content.trimEnd() + "\n";
   const header = content.match(/^##\s+(.+)$/m);
+  const stamp = header && updated ? `<!-- updated=${updated} -->\n` : "";
   if (!header) {
     return existing.trimEnd() ? existing.trimEnd() + "\n\n" + norm : norm;
   }
@@ -65,7 +71,7 @@ export function mergeVaultContent(existing: string, content: string): string {
     }
   }
   if (start === -1) {
-    return existing.trimEnd() ? existing.trimEnd() + "\n\n" + norm : norm;
+    return existing.trimEnd() ? existing.trimEnd() + "\n\n" + norm + stamp : norm + stamp;
   }
 
   let end = lines.length;
@@ -77,7 +83,7 @@ export function mergeVaultContent(existing: string, content: string): string {
   }
   const head = lines.slice(0, start).join("\n").trimEnd();
   const tail = lines.slice(end).join("\n").trimStart();
-  return (head ? head + "\n" : "") + norm + (tail ? tail : "");
+  return (head ? head + "\n" : "") + norm + stamp + (tail ? tail : "");
 }
 
 /** One pending promotion per store target (fire-and-forget dedupe). */
@@ -220,7 +226,11 @@ export async function runVaultPromotion(
     try {
       await fs.mkdir(path.dirname(abs), { recursive: true });
       const existing = await fs.readFile(abs, "utf-8").catch(() => "");
-      await fs.writeFile(abs, existing ? mergeVaultContent(existing, item.content) : item.content, "utf-8");
+      await fs.writeFile(
+        abs,
+        existing ? mergeVaultContent(existing, item.content, todayStr()) : mergeVaultContent("", item.content, todayStr()),
+        "utf-8",
+      );
       promotedCount++;
     } catch {
       // Skip this file; its entries must NOT be removed below.

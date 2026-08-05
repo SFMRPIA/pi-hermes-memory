@@ -84,10 +84,14 @@ export interface MemoryConfig {
   consolidationTimeoutMs: number;
   /** Inject pinned STANDING.md instructions into every session. Default: true */
   standingInstructionsEnabled: boolean;
+  /** Blend of recency vs FTS relevance in memory_search ranking. 0 = pure relevance, 1 = pure recency. Default: 0.4 */
+  memorySearchRecencyWeight: number;
   /** Obsidian-style vault root for long-term promotion. Empty/undefined = disabled. */
   vaultPath?: string;
   /** Fraction of capacity at which stable entries promote to the vault. Default: 0.67 */
   vaultPromoteThreshold: number;
+  /** Days after which an untouched vault section is archived. Default: 90 */
+  vaultRetentionDays: number;
   /** Ensure a Daily/YYYY-MM-DD.md note exists on session start. Default: true */
   vaultDailyNotes: boolean;
 }
