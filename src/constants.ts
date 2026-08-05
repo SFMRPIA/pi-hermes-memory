@@ -29,6 +29,12 @@ export const DEFAULT_FLUSH_RECENT_MESSAGES = 0;
  * including lower ones; `loadConfig` warns when a value below this is set.
  */
 export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 600000;
+/**
+ * Minimum gap between auto-consolidation attempts per target. Without this a
+ * store left over-cap by a failed/instant-killed run re-schedules on every
+ * capacity write — an observed 85-run storm in one hour at startup (#storm).
+ */
+export const DEFAULT_CONSOLIDATION_COOLDOWN_MS = 15000;
 export const DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS = 7;
 export const DEFAULT_FAILURE_INJECTION_MAX_ENTRIES = 5;
 

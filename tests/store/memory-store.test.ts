@@ -205,6 +205,33 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(result.error!.includes("exceed the limit"));
     });
 
+    it("gates re-triggering of background consolidation behind a cooldown", async () => {
+      let consolidatorCalls = 0;
+      const store = new MemoryStore(makeConfig({
+        memoryCharLimit: 50,
+        memoryOverflowStrategy: "auto-consolidate",
+        autoConsolidate: true,
+      }));
+      store.setConsolidator(async () => {
+        consolidatorCalls++;
+        return { consolidated: false }; // simulate a failed/instant-killed run
+      });
+      await store.loadFromDisk();
+
+      const first = await store.add("memory", `${TEST_MARKER} ${"x".repeat(60)}`);
+      await settle();
+      assert.ok(first.success, first.error);
+
+      // The store is still over its limit; without the cooldown this second
+      // write would schedule another (failed) consolidation immediately — the
+      // observed 85-run startup storm.
+      const second = await store.add("memory", `${TEST_MARKER} ${"y".repeat(60)}`);
+      await settle();
+
+      assert.ok(second.success, second.error);
+      assert.equal(consolidatorCalls, 1, "second overflow write must not re-trigger within the cooldown");
+    });
+
     it("evicts oldest entries in file order when memoryOverflowStrategy is fifo-evict", async () => {
       let consolidatorCalled = false;
       const store = new MemoryStore(makeConfig({

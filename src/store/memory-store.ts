@@ -22,6 +22,7 @@ import {
   DEFAULT_USER_CHAR_LIMIT,
   DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
+  DEFAULT_CONSOLIDATION_COOLDOWN_MS,
   MEMORY_FILE,
   USER_FILE,
 } from "../constants.js";
@@ -54,6 +55,12 @@ export class MemoryStore {
 
   /** Targets with a background consolidation already scheduled (overflow path) */
   private pendingConsolidations = new Set<"memory" | "user" | "failure">();
+  /**
+   * When each target's last background consolidation attempt ended (Date.now),
+   * used to gate re-triggering: an over-cap store whose run failed or was
+   * killed instantly would otherwise re-schedule on every capacity write.
+   */
+  private lastConsolidationAttemptAt = new Map<"memory" | "user" | "failure", number>();
   private mutationObserver: ((target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>) | null = null;
 
   constructor(private config: MemoryConfig) {}
@@ -262,8 +269,11 @@ export class MemoryStore {
     if (!accepted.success) return accepted;
 
     if (!this.pendingConsolidations.has(target)) {
-      this.pendingConsolidations.add(target);
-      void this.consolidateInBackground(target);
+      const lastAttempt = this.lastConsolidationAttemptAt.get(target) ?? 0;
+      if (Date.now() - lastAttempt >= DEFAULT_CONSOLIDATION_COOLDOWN_MS) {
+        this.pendingConsolidations.add(target);
+        void this.consolidateInBackground(target);
+      }
     }
 
     return this.successResponse(
@@ -281,6 +291,9 @@ export class MemoryStore {
     } catch {
       // Failure is already surfaced (console.warn) by the index.ts wrapper
     } finally {
+      // Recorded in finally so a success, a failure and an instant kill all
+      // count as attempts and start the cooldown.
+      this.lastConsolidationAttemptAt.set(target, Date.now());
       this.pendingConsolidations.delete(target);
     }
   }
