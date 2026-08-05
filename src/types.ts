@@ -82,6 +82,8 @@ export interface MemoryConfig {
   nudgeToolCalls: number;
   /** Maximum time in milliseconds for a consolidation run, auto or manual. Default: 180000 */
   consolidationTimeoutMs: number;
+  /** Inject pinned STANDING.md instructions into every session. Default: true */
+  standingInstructionsEnabled: boolean;
   /** Obsidian-style vault root for long-term promotion. Empty/undefined = disabled. */
   vaultPath?: string;
   /** Fraction of capacity at which stable entries promote to the vault. Default: 0.67 */

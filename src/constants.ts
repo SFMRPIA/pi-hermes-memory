@@ -39,6 +39,15 @@ export const DEFAULT_VAULT_DAILY_NOTES = true;
 // ─── File names ───
 export const MEMORY_FILE = "MEMORY.md";
 export const USER_FILE = "USER.md";
+export const STANDING_FILE = "STANDING.md";
+
+// ─── Standing instructions (#121) ───
+// A hard budget, deliberately separate from memoryCharLimit/userCharLimit.
+// These are injected in every mode including policy-only, so the cost has to
+// stay something a user can hold in their head; MEMORY.md + USER.md routinely
+// run to tens of KB and must never be able to crowd this out.
+export const STANDING_MAX_ENTRIES = 20;
+export const STANDING_MAX_CHARS = 2000;
 
 // ─── Runtime memory policy prompt ───
 export const MEMORY_POLICY_PROMPT = `<memory-policy>
