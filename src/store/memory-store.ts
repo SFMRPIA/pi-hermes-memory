@@ -270,6 +270,10 @@ export class MemoryStore {
 
     if (!this.pendingConsolidations.has(target)) {
       const lastAttempt = this.lastConsolidationAttemptAt.get(target) ?? 0;
+      // Consolidation children are spawned with a @prompt-file argument; their
+      // fresh MemoryStore has an empty cooldown map, so an over-cap write inside
+      // the child would re-trigger consolidation forever (grandchild storm).
+      if (process.argv.some((arg) => arg.startsWith("@"))) return;
       if (Date.now() - lastAttempt >= DEFAULT_CONSOLIDATION_COOLDOWN_MS) {
         this.pendingConsolidations.add(target);
         void this.consolidateInBackground(target);
