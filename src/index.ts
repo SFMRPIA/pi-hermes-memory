@@ -287,6 +287,12 @@ export default function (pi: ExtensionAPI) {
     let release!: () => void;
     autoConsolidationTail = new Promise<void>((resolve) => { release = resolve; });
     const result = await previous.then(run).finally(release);
+    // The subprocess child rewrites the store files on disk; the parent's
+    // in-memory entries would otherwise stay stale and re-publish the old set
+    // on the next write (the regrowth loop). Reload so memory == disk.
+    if (result.consolidated) {
+      await targetStore.loadFromDisk();
+    }
     if (!result.consolidated) {
       // Failures go to the consolidation log file, not the terminal (the user
       // asked for a clean console; the retry/self-healing path already handles

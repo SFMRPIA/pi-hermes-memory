@@ -187,15 +187,6 @@ export async function triggerConsolidation(
     }
   }
 
-  const prompt = [
-    CONSOLIDATION_PROMPT,
-    "",
-    `--- Current ${labelForTarget(target, toolTarget)} Entries ---`,
-    currentContent || "(empty)",
-    "",
-    `Use the memory tool to consolidate. Target: '${toolTarget}'`,
-  ].join("\n");
-
   let lock: ConsolidationLock | null = null;
   const runStartedAt = Date.now();
 
@@ -208,26 +199,61 @@ export async function triggerConsolidation(
       };
     }
 
-    const result = await execChildPrompt(pi, prompt, llmConfig, {
-      signal,
-      timeoutMs,
-      retryWithoutOverrides: true,
-    }) as { code: number; stdout?: string; stderr?: string; killed?: boolean };
+    // Chunked consolidation: one giant prompt over a huge store times out
+    // (the LLM cannot summarize 100k+ chars in one pass). Split the entries
+    // into small chunks so every child finishes quickly; the children run
+    // sequentially under the same lock and each removes only its own slice.
+    const CHUNK_CHARS = 8000;
+    const chunks: string[][] = [];
+    let chunk: string[] = [];
+    let chunkChars = 0;
+    for (const entry of entries) {
+      if (chunk.length > 0 && chunkChars + entry.length > CHUNK_CHARS) {
+        chunks.push(chunk);
+        chunk = [];
+        chunkChars = 0;
+      }
+      chunk.push(entry);
+      chunkChars += entry.length + ENTRY_DELIMITER.length;
+    }
+    if (chunk.length > 0) chunks.push(chunk);
+    // Preserve legacy behavior: even an empty store runs one (no-op) child.
+    if (chunks.length === 0) chunks.push([]);
 
-    const elapsedMs = Date.now() - runStartedAt;
-    appendConsolidationLog(
-      `[hermes-memory] consolidate child done target=${toolTarget} code=${result.code} killed=${result.killed ?? false} elapsed=${elapsedMs}ms ts=${new Date().toISOString()}`,
-    );
-
-    if (result.code === 0) {
+    let ok = false;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkContent = chunks[i].join(ENTRY_DELIMITER);
+      const chunkPrompt = [
+        CONSOLIDATION_PROMPT,
+        "",
+        `--- Current ${labelForTarget(target, toolTarget)} Entries (chunk ${i + 1}/${chunks.length}) ---`,
+        chunkContent || "(empty)",
+        "",
+        `Use the memory tool to consolidate. Target: '${toolTarget}'`,
+      ].join("\n");
+      const result = await execChildPrompt(pi, chunkPrompt, llmConfig, {
+        signal,
+        timeoutMs,
+        retryWithoutOverrides: true,
+      }) as { code: number; stdout?: string; stderr?: string; killed?: boolean };
+      const elapsedMs = Date.now() - runStartedAt;
+      appendConsolidationLog(
+        `[hermes-memory] consolidate child done target=${toolTarget} chunk=${i + 1}/${chunks.length} code=${result.code} killed=${result.killed ?? false} elapsed=${elapsedMs}ms ts=${new Date().toISOString()}`,
+      );
+      if (result.code !== 0) {
+        await restorePreRunEntries(store, target, entries);
+        appendConsolidationLog(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget}`);
+        return {
+          consolidated: false,
+          error: describeConsolidationFailure(result, timeoutMs),
+        };
+      }
+      ok = true;
+    }
+    if (ok) {
       return { consolidated: true };
     }
-    await restorePreRunEntries(store, target, entries);
-    appendConsolidationLog(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget}`);
-    return {
-      consolidated: false,
-      error: describeConsolidationFailure(result, timeoutMs),
-    };
+    return { consolidated: false, error: "no chunks to consolidate" };
   } catch (err) {
     await restorePreRunEntries(store, target, entries);
     appendConsolidationLog(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget} (exception)`);
