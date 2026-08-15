@@ -55,9 +55,13 @@ const OVERRIDE_FAILURE_REASON = /\b(not found|unknown|invalid|unsupported|unavai
 // Resolve the path to pi-hermes-memory's own extension entry point.
 // Used to pass -e <path> to child subprocesses so they only load this
 // extension instead of all plugins from settings.json.
+//
+// Children only need the memory tool, so they load the lean
+// consolidation-child.ts entry (stores + memory tool + SQLite mirror)
+// instead of the full index.ts boot (skills, vault, backfill, handlers).
 const OWN_EXTENSION_PATH: string = (() => {
   try {
-    return resolve(dirname(fileURLToPath(import.meta.url)), "../index.ts");
+    return resolve(dirname(fileURLToPath(import.meta.url)), "../consolidation-child.ts");
   } catch {
     return "";
   }
