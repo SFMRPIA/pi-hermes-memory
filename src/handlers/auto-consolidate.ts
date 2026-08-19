@@ -12,6 +12,11 @@
  *
  * The subprocess child process modifies files on disk, so the parent MUST
  * reload from disk after a subprocess-based consolidation completes.
+ *
+ * IMPORTANT: subprocess children consolidate via the memory tool, which writes
+ * Markdown only — the SQLite search mirror (used by memory_search) is never
+ * updated by the subprocess. We reconcile it after consolidation completes so
+ * memory_search doesn't keep serving stale pre-consolidation rows.
  */
 
 import * as fs from "node:fs/promises";
@@ -32,6 +37,7 @@ import { appendConsolidationLog } from "./consolidation-log.js";
 import { execChildPrompt } from "./pi-child-process.js";
 import { runDirectMemoryCompletion, usesDirectTransport } from "./review-memory-ops.js";
 import { AtomicLockCoordinator } from "../store/atomic-lock-coordinator.js";
+import { syncMarkdownMemoriesToSqlite } from "./sync-markdown-memories.js";
 
 type MemoryTarget = "memory" | "user" | "failure";
 type ToolMemoryTarget = MemoryTarget | "project";
@@ -148,6 +154,16 @@ export async function triggerConsolidation(
   deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion } = {},
 ): Promise<ConsolidationResult> {
   const entries = entriesForTarget(store, target);
+  if (store && typeof store.dedupeTarget === "function") {
+    try {
+      const removed = await store.dedupeTarget(target);
+      if (removed > 0) {
+        appendConsolidationLog(`[hermes-memory] pre-chunk deterministic dedup removed ${removed} for ${toolTarget}`);
+      }
+    } catch (dedupErr) {
+      appendConsolidationLog(`[hermes-memory] pre-chunk dedup skipped: ${String(dedupErr).slice(0, 200)}`);
+    }
+  }
   const currentContent = entries.join(ENTRY_DELIMITER);
   const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
 
@@ -155,7 +171,26 @@ export async function triggerConsolidation(
     `[hermes-memory] consolidate start target=${toolTarget} entries=${entries.length} chars=${currentContent.length} timeout=${timeoutMs} transport=${directCtx && usesDirectTransport(llmConfig) ? "direct" : "subprocess"} model=${llmConfig.llmModelOverride?.trim() || "(default)"} thinking=${llmConfig.llmThinkingOverride ?? "(inherit)"} ts=${new Date().toISOString()}`,
   );
 
-  if (directCtx && usesDirectTransport(llmConfig)) {
+  // ─── Single-flight lock: acquire ONCE up front so BOTH the direct
+  // (in-process) transport and the subprocess transport are mutually
+  // exclusive per target. Previously the direct transport bypassed this lock
+  // entirely, so a direct run could overlap an auto-consolidation subprocess —
+  // the storm where two children read+write the same store and merged or
+  // duplicated entries. ───
+  const lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
+  if (!lock) {
+    return {
+      consolidated: false,
+      error: `Consolidation already in progress for target '${toolTarget}'. Skipping duplicate run.`,
+    };
+  }
+  const runStartedAt = Date.now();
+
+  // Direct transport runs under the same lock; it is only successful if it
+  // both runs AND frees space, otherwise we fall through to the subprocess
+  // below (still under this lock, so never concurrent with another run).
+  const directOk = await (async () => {
+    if (!(directCtx && usesDirectTransport(llmConfig))) return false;
     try {
       const directResult = await runDirect(
         directCtx,
@@ -176,28 +211,18 @@ export async function triggerConsolidation(
         dbManager,
         projectName,
       );
-      // Consolidation only did its job if it actually freed space — unlike
-      // review/flush/correction, an empty or fully-skipped result here is a
-      // failure worth falling back to subprocess for, not a normal outcome.
-      if (directResult.ok && directResult.appliedCount > 0) {
-        return { consolidated: true };
-      }
+      return directResult.ok && directResult.appliedCount > 0;
     } catch {
-      // Fall through to subprocess below.
+      return false;
     }
+  })();
+  if (directOk) {
+    await resyncSqliteAfterConsolidation(dbManager);
+    await lock.release().catch(() => {});
+    return { consolidated: true };
   }
 
-  let lock: ConsolidationLock | null = null;
-  const runStartedAt = Date.now();
-
   try {
-    lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
-    if (!lock) {
-      return {
-        consolidated: false,
-        error: `Consolidation already in progress for target '${toolTarget}'. Skipping duplicate subprocess.`,
-      };
-    }
 
     // Chunked consolidation: one giant prompt over a huge store times out
     // (the LLM cannot summarize 100k+ chars in one pass). Split the entries
@@ -251,6 +276,7 @@ export async function triggerConsolidation(
       ok = true;
     }
     if (ok) {
+      await resyncSqliteAfterConsolidation(dbManager);
       return { consolidated: true };
     }
     return { consolidated: false, error: "no chunks to consolidate" };
@@ -265,6 +291,33 @@ export async function triggerConsolidation(
     if (lock) {
       try { await lock.release(); } catch { /* best-effort cleanup */ }
     }
+  }
+}
+
+/**
+ * Best-effort reconciliation of the SQLite search mirror after consolidation.
+ *
+ * Consolidation children (subprocess AND direct-transport memory-tool writes)
+ * only persist to Markdown; the FTS5 mirror backing memory_search is left stale.
+ * This re-syncs it so subsequent searches don't surface pre-consolidation rows.
+ * Idempotent — a clean mirror reconciles to import=0/removed=0, so double-sync
+ * on the direct path is harmless. Never throws to the consolidation caller.
+ */
+async function resyncSqliteAfterConsolidation(
+  dbManager: DatabaseManager | null,
+): Promise<void> {
+  if (!dbManager) return;
+  try {
+    await syncMarkdownMemoriesToSqlite(
+      dbManager,
+      path.join(AGENT_ROOT, "pi-hermes-memory"),
+      "projects-memory",
+      AGENT_ROOT,
+    );
+  } catch (syncErr) {
+    appendConsolidationLog(
+      `[hermes-memory] post-consolidation sqlite resync skipped: ${String(syncErr).slice(0, 200)}`,
+    );
   }
 }
 

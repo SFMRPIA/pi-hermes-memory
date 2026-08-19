@@ -129,6 +129,79 @@ export class MemoryStore {
     return this.config.memoryOverflowStrategy ?? (this.config.autoConsolidate ? "auto-consolidate" : "reject");
   }
 
+  /** Deterministic normalization for near-duplicate detection (no LLM). */
+  private normalizeForDedup(text: string): string {
+    return text
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  /** Token-level Jaccard similarity over significant tokens (0..1). */
+  private similarity(a: string, b: string): number {
+    const tok = (s: string) => new Set(
+      s.split(/\s+/).map((t) => t.replace(/[^a-z0-9]/gi, "")).filter((t) => t.length > 3),
+    );
+    const ta = tok(a);
+    const tb = tok(b);
+    if (!ta.size || !tb.size) return 0;
+    let inter = 0;
+    for (const t of ta) if (tb.has(t)) inter++;
+    const union = ta.size + tb.size - inter;
+    return union ? inter / union : 0;
+  }
+
+  /** True when two entries are near-duplicates (same fact, reworded). */
+  private isNearDuplicate(a: string, b: string): boolean {
+    const na = this.normalizeForDedup(a);
+    const nb = this.normalizeForDedup(b);
+    if (na === nb) return true;
+    if (Math.min(na.length, nb.length) < 40) return false;
+    const tok = (s: string) => new Set(
+      s.split(/\s+/).map((t) => t.replace(/[^a-z0-9]/gi, "")).filter((t) => t.length > 3),
+    );
+    const ta = tok(na);
+    const tb = tok(nb);
+    if (!ta.size || !tb.size) return false;
+    const [small, large] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
+    let inter = 0;
+    for (const t of small) if (large.has(t)) inter++;
+    // A reworded copy keeps most of the original's significant tokens: if >=80%
+    // of the shorter entry's tokens appear in the longer, they are duplicates.
+    return inter / small.size >= 0.8;
+  }
+
+  /**
+   * Deterministically collapse duplicate entries in a target store (keeps the
+   * FIRST occurrence, preserves order) and persists. Returns count removed.
+   * Rejects entries that are normalized-equal OR near-duplicates (reworded
+   * copies) of any already-kept entry — the exact case the consolidation storm
+   * produces. O(n²) but stores are small and this is consolidation/add-time only.
+   */
+  async dedupeTarget(target: "memory" | "user" | "failure"): Promise<number> {
+    const entries = this.entriesFor(target);
+    const kept: string[] = [];
+    const keptNorms: string[] = [];
+    let removed = 0;
+    for (const entry of entries) {
+      const decoded = this.decodeEntry(entry);
+      const norm = this.normalizeForDedup(decoded.text);
+      const duplicate = norm !== "" && keptNorms.some((k) => this.isNearDuplicate(k, norm));
+      if (duplicate) {
+        removed++;
+        continue;
+      }
+      if (norm !== "") keptNorms.push(norm);
+      kept.push(entry);
+    }
+    if (removed > 0) {
+      this.setEntries(target, kept);
+      await this.saveToDisk(target);
+    }
+    return removed;
+  }
+
   // ─── Load from disk ───
 
   async loadFromDisk(): Promise<void> {
@@ -210,6 +283,26 @@ export class MemoryStore {
     });
     if (duplicate) {
       return this.successResponse(target, "Entry already exists (no duplicate added).");
+    }
+
+    // Near-duplicate: same fact, slightly reworded. Merge deterministically by
+    // keeping the more complete copy — replace the existing entry if the new
+    // one is longer, otherwise skip. No LLM, prevents storm-style bloat at the
+    // source (the exact-match above only caught byte-identical copies).
+    const nearDupIndex = entries.findIndex((entry) => {
+      const decoded = this.decodeEntry(entry);
+      if (target === "failure" && decoded.project !== normalizedProject) return false;
+      return this.isNearDuplicate(decoded.text, content);
+    });
+    if (nearDupIndex !== -1) {
+      const existing = this.decodeEntry(entries[nearDupIndex]);
+      if (content.length > existing.text.length) {
+        const today = new Date().toISOString().split("T")[0];
+        entries[nearDupIndex] = this.encodeEntry(content, today, today, project ?? existing.project ?? undefined);
+        this.setEntries(target, entries);
+        await this.saveToDisk(target);
+      }
+      return this.successResponse(target, "Merged with existing similar entry.");
     }
 
     // Encode metadata: both dates = today
