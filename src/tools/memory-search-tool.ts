@@ -62,20 +62,32 @@ Returns matching memory entries with project context and dates.`,
       const results = searchMemories(dbManager, query, { project, target, category, limit, recencyWeight });
 
       if (results.length === 0) {
-        // Hot had no hit — fall back to the vault so squeezed/archived history
-        // is still auto-discoverable without an explicit vault_search call.
+        // Hot had no hit — fall back warm → cold so squeezed history stays
+        // auto-discoverable. Warm (System/Assistant + Daily) is recent promoted
+        // context; cold (System/Archive) is 90-day aged — warm outranks cold.
         if (config && vaultConfigured(config.vaultPath)) {
           try {
-            const vaultHits = await searchVault(config.vaultPath!, query, Math.min(limit, 10));
+            const cap = Math.min(limit, 10);
+            const warmHits: Array<{ file: string; line: number; text: string }> = [];
+            warmHits.push(...await searchVault(config.vaultPath!, query, cap, "System/Assistant"));
+            if (warmHits.length < cap) {
+              warmHits.push(...await searchVault(config.vaultPath!, query, cap - warmHits.length, "Daily"));
+            }
+            let vaultHits = warmHits;
+            let tier: "warm" | "cold" = "warm";
+            if (vaultHits.length === 0) {
+              vaultHits = await searchVault(config.vaultPath!, query, cap, "System/Archive");
+              tier = "cold";
+            }
             if (vaultHits.length > 0) {
-              let vaultOutput = `No hot memories matched "${query}" — found ${vaultHits.length} vault hit(s):\n\n`;
+              let vaultOutput = `No hot memories matched "${query}" — found ${vaultHits.length} ${tier} vault hit(s):\n\n`;
               for (const h of vaultHits) vaultOutput += `📁 ${h.file}:${h.line} — ${h.text}\n`;
               const vr: SearchResult = { success: true, count: vaultHits.length, output: vaultOutput.trim() };
               return { content: [{ type: 'text' as const, text: vaultOutput.trim() }], details: vr };
             }
           } catch {}
         }
-        const result: SearchResult = { success: true, count: 0, message: `No memories found matching "${query}" (hot + vault). Try a different search term or broader query.` };
+        const result: SearchResult = { success: true, count: 0, message: `No memories found matching "${query}" (hot + warm + cold). Try a different search term or broader query.` };
         return { content: [{ type: 'text' as const, text: result.message! }], details: result };
       }
 
@@ -95,7 +107,7 @@ Returns matching memory entries with project context and dates.`,
   });
 }
 
-async function searchVault(vaultPath: string, query: string, limit: number): Promise<Array<{ file: string; line: number; text: string }>> {
+async function searchVault(vaultPath: string, query: string, limit: number, subPath = ""): Promise<Array<{ file: string; line: number; text: string }>> {
   const q = query.toLowerCase().trim();
   if (!q) return [];
   const files: string[] = [];
@@ -111,7 +123,7 @@ async function searchVault(vaultPath: string, query: string, limit: number): Pro
       else if (st.isFile() && e.endsWith(".md")) files.push(childRel);
     }
   }
-  await walk(vaultPath, "");
+  await walk(vaultPath, subPath);
   const hits: Array<{ file: string; line: number; text: string }> = [];
   for (const file of files) {
     if (hits.length >= limit) break;
