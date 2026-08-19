@@ -187,13 +187,24 @@ export async function triggerConsolidation(
   // exclusive per target. Previously the direct transport bypassed this lock
   // entirely, so a direct run could overlap an auto-consolidation subprocess —
   // the storm where two children read+write the same store and merged or
-  // duplicated entries. ───
-  const lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
+  // duplicated entries.
+  // With many concurrent sessions (global memory shared across projects),
+  // waiting is more thorough than skipping: the waiter re-checks after the
+  // holder finishes and squeezes if still over cap.
+  let lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
   if (!lock) {
-    return {
-      consolidated: false,
-      error: `Consolidation already in progress for target '${toolTarget}'. Skipping duplicate run.`,
-    };
+    const waitStart = Date.now();
+    const waitBudgetMs = Math.min(120000, Math.max(10000, Math.floor(timeoutMs / 3)));
+    while (!lock && Date.now() - waitStart < waitBudgetMs) {
+      await new Promise((r) => setTimeout(r, 500));
+      lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
+    }
+    if (!lock) {
+      return {
+        consolidated: false,
+        error: `Consolidation still in progress for target '${toolTarget}' after wait, skipping.`,
+      };
+    }
   }
   const runStartedAt = Date.now();
 
