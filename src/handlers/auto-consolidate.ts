@@ -153,10 +153,10 @@ export async function triggerConsolidation(
   projectName?: string | null,
   deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion } = {},
 ): Promise<ConsolidationResult> {
-  const entries = entriesForTarget(store, target);
-  if (store && typeof store.dedupeTarget === "function") {
+  let entries = entriesForTarget(store, target);
+  if (store && typeof (store as unknown as { dedupeTarget?: (t: string) => Promise<number> }).dedupeTarget === "function") {
     try {
-      const removed = await store.dedupeTarget(target);
+      const removed = await (store as unknown as { dedupeTarget: (t: string) => Promise<number> }).dedupeTarget(target);
       if (removed > 0) {
         appendConsolidationLog(`[hermes-memory] pre-chunk deterministic dedup removed ${removed} for ${toolTarget}`);
       }
@@ -164,6 +164,17 @@ export async function triggerConsolidation(
       appendConsolidationLog(`[hermes-memory] pre-chunk dedup skipped: ${String(dedupErr).slice(0, 200)}`);
     }
   }
+  if (store && typeof (store as unknown as { squeezeToCap?: (t: string) => Promise<number> }).squeezeToCap === "function") {
+    try {
+      const squeezed = await (store as unknown as { squeezeToCap: (t: string) => Promise<number> }).squeezeToCap(target);
+      if (squeezed > 0) {
+        appendConsolidationLog(`[hermes-memory] cap squeeze archived ${squeezed} for ${toolTarget}`);
+      }
+    } catch (squeezeErr) {
+      appendConsolidationLog(`[hermes-memory] cap squeeze skipped: ${String(squeezeErr).slice(0, 200)}`);
+    }
+  }
+  entries = entriesForTarget(store, target);
   const currentContent = entries.join(ENTRY_DELIMITER);
   const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
 

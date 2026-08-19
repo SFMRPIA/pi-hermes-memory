@@ -202,6 +202,42 @@ export class MemoryStore {
     return removed;
   }
 
+  /**
+   * Vault-backed cap squeeze: while the store exceeds its char limit, evict
+   * the oldest entries (by last-referenced date) until under cap. Each evicted
+   * entry is archived to the vault first (best-effort) so no data is lost —
+   * then removed from hot. Returns count squeezed. Deterministic, no LLM.
+   */
+  async squeezeToCap(target: "memory" | "user" | "failure"): Promise<number> {
+    const limit = this.charLimit(target);
+    let squeezed = 0;
+    while (this.charCount(target) > limit && this.entriesFor(target).length > 1) {
+      const entries = this.entriesFor(target);
+      let oldestIdx = 0;
+      let oldestDate = this.decodeEntry(entries[0]).lastReferenced || "9999-12-31";
+      for (let i = 1; i < entries.length; i++) {
+        const d = this.decodeEntry(entries[i]).lastReferenced || "9999-12-31";
+        if (d < oldestDate) {
+          oldestDate = d;
+          oldestIdx = i;
+        }
+      }
+      const [evicted] = entries.splice(oldestIdx, 1);
+      squeezed++;
+      // Best-effort vault archive: append the evicted text to vault's squeezed log
+      try {
+        const vaultPath = (this.config as unknown as { vaultPath?: string }).vaultPath?.trim();
+        if (vaultPath) {
+          const { appendLogEntry } = await import("../handlers/vault-notes.js");
+          const text = this.decodeEntry(evicted).text || this.stripMetadata(evicted);
+          await appendLogEntry(vaultPath, `## Squeezed from ${target} (${oldestDate})\n\n${text}\n`, "log");
+        }
+      } catch {}
+    }
+    if (squeezed > 0) await this.saveToDisk(target);
+    return squeezed;
+  }
+
   // ─── Load from disk ───
 
   async loadFromDisk(): Promise<void> {
