@@ -332,7 +332,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── 11. SQLite session search + extended memory ──
   registerSessionSearchTool(pi, dbManager, config.sessionSearch ?? { variant: "legacy" });
-  registerMemorySearchTool(pi, dbManager, config.memorySearchRecencyWeight);
+  registerMemorySearchTool(pi, dbManager, config.memorySearchRecencyWeight, config);
   registerIndexSessionsCommand(pi);
 
   // ── 12. Auto-index session on shutdown ──
