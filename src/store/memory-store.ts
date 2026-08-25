@@ -402,7 +402,7 @@ export class MemoryStore {
       // Consolidation children are spawned with a @prompt-file argument; their
       // fresh MemoryStore has an empty cooldown map, so an over-cap write inside
       // the child would re-trigger consolidation forever (grandchild storm).
-      if (process.argv.some((arg) => arg.startsWith("@"))) return;
+      if (process.argv.some((arg) => arg.startsWith("@"))) return accepted;
       if (Date.now() - lastAttempt >= DEFAULT_CONSOLIDATION_COOLDOWN_MS) {
         this.pendingConsolidations.add(target);
         void this.consolidateInBackground(target);
@@ -467,9 +467,14 @@ export class MemoryStore {
   private memoryFullError(target: "memory" | "user" | "failure", contentLength: number): MemoryResult {
     const current = this.charCount(target);
     const limit = this.charLimit(target);
+    const entries = this.entriesFor(target).map((raw) => this.decodeEntry(raw).text);
     return {
       success: false,
-      error: `Memory at ${current}/${limit} chars. Adding this entry (${contentLength} chars) would exceed the limit. Replace or remove existing entries first.`,
+      error: `Memory at ${current}/${limit} chars. Adding this entry (${contentLength} chars) would exceed the limit. Replace or remove existing entries first (see the entries list below), then retry this add — all in this turn.`,
+      target,
+      usage: `${current}/${limit} chars`,
+      entry_count: entries.length,
+      entries,
     };
   }
 
