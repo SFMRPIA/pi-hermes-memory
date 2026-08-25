@@ -344,6 +344,30 @@ describe('sqlite-memory-store', () => {
       assert.ok(results.length > 0);
       assert.ok(results.some(r => r.content.includes('Prisma')));
     });
+    it('finds pure CJK substrings with the trigram tokenizer', () => {
+      addMemory(dbManager, '设备清单包含 NAS 和备份策略');
+
+      const results = searchMemories(dbManager, '设备清单');
+
+      assert.ok(results.length > 0);
+      assert.ok(results.some((result) => result.content.includes('设备清单')));
+    });
+
+    it('retains English token searches in the trigram index', () => {
+      addMemory(dbManager, '设备清单包含 NAS 和备份策略');
+
+      const results = searchMemories(dbManager, 'NAS');
+
+      assert.ok(results.length > 0);
+      assert.ok(results.some((result) => result.content.includes('NAS')));
+    });
+
+    it('documents that one- and two-character queries do not match trigram FTS', () => {
+      addMemory(dbManager, '设备清单包含 NAS 和备份策略');
+
+      assert.deepStrictEqual(searchMemories(dbManager, '设备'), []);
+    });
+
 
     it('should match multi-word queries without requiring an exact phrase', () => {
       const results = searchMemories(dbManager, 'gpu issue');

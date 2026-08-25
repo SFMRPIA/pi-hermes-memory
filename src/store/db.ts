@@ -73,6 +73,23 @@ class DatabaseCorruptionError extends Error {
 export const SQLITE_BUSY_TIMEOUT_MS = 5000;
 export const SQLITE_WAL_AUTOCHECKPOINT_PAGES = 1000;
 
+const FTS5_TOKENIZER_VERSION_KEY = 'fts5_tokenizer_version';
+const FTS5_TOKENIZER_VERSION = 'trigram-v1';
+const FTS5_TRIGRAM_TABLES = {
+  message: `CREATE VIRTUAL TABLE message_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='rowid',
+    tokenize='trigram'
+  )`,
+  memory: `CREATE VIRTUAL TABLE memory_fts USING fts5(
+    content,
+    content='memories',
+    content_rowid='id',
+    tokenize='trigram'
+  )`,
+} as const;
+
 const DATABASE_FILE_SUFFIXES: readonly DatabaseFileSuffix[] = ['', '-wal', '-shm'];
 const MEMORY_TARGETS = new Set(['memory', 'user', 'failure']);
 const MEMORY_CATEGORIES = new Set(['failure', 'correction', 'insight', 'preference', 'convention', 'tool-quirk']);
@@ -326,7 +343,7 @@ export class DatabaseManager {
     // CHECK(target IN ('memory','user')) constraints to include 'failure'.
     this.ensureLegacySchemaColumns(db);
     this.migrateLegacyMemoriesTargetConstraint(db);
-    this.rebuildMemoryFts(db);
+    this.migrateFtsTokenizer(db);
   }
 
   private hasExistingMainDatabaseFile(): boolean {
@@ -982,12 +999,55 @@ export class DatabaseManager {
     }
   }
 
-  private rebuildMemoryFts(db: DatabaseLike): void {
-    const ftsTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_fts'").get() as { name?: string } | undefined;
-    if (!ftsTable) return;
+  /**
+   * Upgrade existing unicode61 FTS tables to the trigram tokenizer.
+   *
+   * `CREATE VIRTUAL TABLE IF NOT EXISTS` cannot change an existing FTS
+   * tokenizer, so this migration drops and recreates both external-content
+   * indexes, then repopulates them from their source tables. The metadata
+   * marker makes the migration versioned and idempotent.
+   */
+  private migrateFtsTokenizer(db: DatabaseLike): void {
+    const versionRow = db.prepare(
+      'SELECT value FROM extension_metadata WHERE key = ?',
+    ).get(FTS5_TOKENIZER_VERSION_KEY) as { value?: string } | undefined;
 
-    // Keep FTS index consistent after table rebuild/migrations.
-    db.exec("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')");
+    const usesTrigram = (tableName: string): boolean => {
+      const row = db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get(tableName) as { sql?: string } | undefined;
+      return typeof row?.sql === 'string'
+        && /\btokenize\s*=\s*['"]trigram['"]/i.test(row.sql);
+    };
+
+    if (
+      versionRow?.value === FTS5_TOKENIZER_VERSION
+      && usesTrigram('message_fts')
+      && usesTrigram('memory_fts')
+    ) {
+      return;
+    }
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec(`
+        DROP TABLE IF EXISTS message_fts;
+        DROP TABLE IF EXISTS memory_fts;
+        ${FTS5_TRIGRAM_TABLES.message};
+        ${FTS5_TRIGRAM_TABLES.memory};
+        INSERT INTO message_fts(message_fts) VALUES ('rebuild');
+        INSERT INTO memory_fts(memory_fts) VALUES ('rebuild');
+      `);
+      db.prepare(`
+        INSERT INTO extension_metadata (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(FTS5_TOKENIZER_VERSION_KEY, FTS5_TOKENIZER_VERSION);
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* preserve migration error */ }
+      throw error;
+    }
   }
 
   /**

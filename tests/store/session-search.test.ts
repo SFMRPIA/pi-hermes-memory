@@ -50,6 +50,28 @@ describe('session-search', () => {
       assert.ok(results.length > 0);
       assert.ok(results.some(r => r.content.includes('Prisma')));
     });
+    it('finds pure CJK substrings with the trigram tokenizer', () => {
+      indexSession(dbManager, createTestSession({ id: 'cjk-trigram-session', messages: [
+        { id: 'cjk-trigram-session-msg-1', role: 'assistant', content: '设备清单包含 NAS 和备份策略', timestamp: '2026-05-03T00:01:00Z' },
+      ] }));
+
+      const results = searchSessions(dbManager, '设备清单');
+
+      assert.ok(results.length > 0);
+      assert.ok(results.some((result) => result.content.includes('设备清单')));
+    });
+
+    it('retains English token searches in the trigram index', () => {
+      indexSession(dbManager, createTestSession({ id: 'english-trigram-session', messages: [
+        { id: 'english-trigram-session-msg-1', role: 'assistant', content: 'The NAS backup completed successfully.', timestamp: '2026-05-03T00:01:00Z' },
+      ] }));
+
+      const results = searchSessions(dbManager, 'NAS');
+
+      assert.ok(results.length > 0);
+      assert.ok(results.some((result) => result.content.includes('NAS')));
+    });
+
 
     it('should return results with snippets', () => {
       indexSession(dbManager, createTestSession());
