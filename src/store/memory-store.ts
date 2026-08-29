@@ -912,6 +912,7 @@ export class MemoryStore {
           throw error;
         }
       } else {
+        await this.ensureRecoveryDir(filePath);
         const recoveryPath = this.recoveryPathFor(filePath);
         const publishedIdentity = await this.fileIdentity(tmpPath);
         try {
@@ -1010,8 +1011,9 @@ export class MemoryStore {
     filePath: string,
     publishedIdentity: { dev: number; ino: number },
   ): Promise<void> {
+    await this.ensureRecoveryDir(filePath);
     const conflictPath = path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.conflict-local-${Date.now()}-${randomUUID()}`,
     );
     try {
@@ -1035,16 +1037,24 @@ export class MemoryStore {
     }
   }
 
+  private recoveryDirFor(filePath: string): string {
+    return path.join(path.dirname(filePath), ".recovery");
+  }
+
+  private async ensureRecoveryDir(filePath: string): Promise<void> {
+    await fs.mkdir(this.recoveryDirFor(filePath), { recursive: true });
+  }
+
   private recoveryPathFor(filePath: string): string {
     return path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.recovery-${Date.now()}-${randomUUID()}`,
     );
   }
 
   private retiredRecoveryPathFor(filePath: string): string {
     return path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.retired-${Date.now()}-${randomUUID()}`,
     );
   }
@@ -1054,7 +1064,25 @@ export class MemoryStore {
   }
 
   private async pruneRecoveryFiles(filePath: string): Promise<void> {
-    const directory = path.dirname(filePath);
+    const directory = this.recoveryDirFor(filePath);
+    const legacyDirectory = path.dirname(filePath);
+    // Migrate legacy dotfiles from parent dir into .recovery/ (one-time, before prune)
+    try {
+      await this.ensureRecoveryDir(filePath);
+      const escapedLegacy = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const uuidLegacy = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+      const legacyRecovery = new RegExp(`^\\.${escapedLegacy}\\.recovery-\\d+-${uuidLegacy}$`, "i");
+      const legacyRetired = new RegExp(`^\\.${escapedLegacy}\\.retired-\\d+-${uuidLegacy}$`, "i");
+      const legacyConflict = new RegExp(`^\\.${escapedLegacy}\\.conflict-local-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`, "i");
+      const legacyNames = await fs.readdir(legacyDirectory).catch(() => [] as string[]);
+      for (const name of legacyNames) {
+        if (legacyRecovery.test(name) || legacyRetired.test(name) || legacyConflict.test(name)) {
+          try { await tryRenameOrCopy(path.join(legacyDirectory, name), path.join(directory, name)); } catch {}
+        }
+      }
+    } catch {}
+    try { await fs.mkdir(directory, { recursive: true }); } catch {}
+    
     const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const uuidPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
     const recoveryPattern = new RegExp(`^\\.${escapedName}\\.recovery-\\d+-${uuidPattern}$`, "i");
@@ -1158,6 +1186,7 @@ export class MemoryStore {
   }
 
   private async retireRecoveryFile(recoveryPath: string, filePath: string): Promise<void> {
+    await this.ensureRecoveryDir(filePath);
     const retiredPath = this.retiredRecoveryPathFor(filePath);
     const snapshotPath = `${retiredPath}.tmp`;
     const snapshot = await fs.readFile(recoveryPath);
@@ -1173,8 +1202,9 @@ export class MemoryStore {
   }
 
   private async preserveConflictFile(sourcePath: string, filePath: string, kind: string): Promise<string> {
+    await this.ensureRecoveryDir(filePath);
     const conflictPath = path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.conflict-${kind}-${Date.now()}-${randomUUID()}`,
     );
     await fs.copyFile(sourcePath, conflictPath);
