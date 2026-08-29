@@ -42,6 +42,34 @@ const CONFLICT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const CONFLICT_MAX_COUNT = 32;
 const CONFLICT_MAX_BYTES = 64 * 1024 * 1024;
 
+// ponytail: Windows EPERM fallback — hard-link publish fails when pi holds file open; copyFile fallback keeps atomic-enough behavior
+async function tryLinkOrCopy(src: string, dest: string): Promise<void> {
+  try {
+    await fs.link(src, dest);
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+      await fs.copyFile(src, dest);
+    } else {
+      throw e;
+    }
+  }
+}
+
+async function tryRenameOrCopy(src: string, dest: string): Promise<void> {
+  try {
+    await fs.rename(src, dest);
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+      await fs.copyFile(src, dest);
+      await fs.unlink(src);
+    } else {
+      throw e;
+    }
+  }
+}
+
 class ExternalMemoryWriteConflict extends Error {}
 
 export class MemoryStore {
@@ -876,7 +904,7 @@ export class MemoryStore {
 
       if (expectedFingerprint === "missing") {
         try {
-          await fs.link(tmpPath, filePath);
+          await tryLinkOrCopy(tmpPath, filePath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "EEXIST") {
             throw new ExternalMemoryWriteConflict();
@@ -887,7 +915,7 @@ export class MemoryStore {
         const recoveryPath = this.recoveryPathFor(filePath);
         const publishedIdentity = await this.fileIdentity(tmpPath);
         try {
-          await fs.rename(filePath, recoveryPath);
+          await tryRenameOrCopy(filePath, recoveryPath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             throw new ExternalMemoryWriteConflict();
@@ -901,7 +929,7 @@ export class MemoryStore {
             throw new ExternalMemoryWriteConflict();
           }
 
-          await fs.link(tmpPath, filePath);
+          await tryLinkOrCopy(tmpPath, filePath);
           published = true;
 
           const verifiedDisplacedState = await this.readFileState(recoveryPath);
@@ -959,7 +987,7 @@ export class MemoryStore {
 
   private async restoreDisplacedFile(displacedPath: string, filePath: string): Promise<void> {
     try {
-      await fs.link(displacedPath, filePath);
+      await tryLinkOrCopy(displacedPath, filePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
@@ -987,7 +1015,7 @@ export class MemoryStore {
       `.${path.basename(filePath)}.conflict-local-${Date.now()}-${randomUUID()}`,
     );
     try {
-      await fs.rename(filePath, conflictPath);
+      await tryRenameOrCopy(filePath, conflictPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       await this.restoreDisplacedFile(displacedPath, filePath);
@@ -1001,7 +1029,7 @@ export class MemoryStore {
     }
 
     try {
-      await fs.link(conflictPath, filePath);
+      await tryLinkOrCopy(conflictPath, filePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
