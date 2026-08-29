@@ -231,6 +231,8 @@ export const DIRECT_CONSOLIDATION_SYSTEM_PROMPT = `The memory store you're given
 - Remove outdated or superseded entries (entries older than 30 days without recent references are candidates for removal)
 - Keep the most important and frequently-referenced facts
 - Preserve user preferences and corrections (highest priority)
+- Preserve exact identifiers verbatim — store codes, SKUs, IDs, filenames, paths, error codes/messages, and numbers must be kept exactly as written; do not reword, round, or drop them
+- When merging, keep all unique identifiers from source entries and summarize only the surrounding prose; do not invent identifiers
 
 Each entry shows when it was created and last referenced in HTML comments (<!-- created=..., last=... -->). Use this to identify stale entries.
 
@@ -261,6 +263,8 @@ export const CONSOLIDATION_PROMPT = `The memory is at capacity. Review the curre
 - Remove outdated or superseded entries (entries older than 30 days without recent references are candidates for removal)
 - Keep the most important and frequently-referenced facts
 - Preserve user preferences and corrections (highest priority)
+- Preserve exact identifiers verbatim — store codes, SKUs, IDs, filenames, paths, error codes/messages, and numbers must be kept exactly as written; do not reword, round, or drop them
+- When merging, keep all unique identifiers from source entries and summarize only the surrounding prose; do not invent identifiers
 
 Each entry shows when it was created and last referenced in HTML comments (<!-- created=..., last=... -->). Use this to identify stale entries.
 
