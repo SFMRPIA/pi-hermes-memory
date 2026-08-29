@@ -175,8 +175,17 @@ export async function triggerConsolidation(
     }
   }
   entries = entriesForTarget(store, target);
-  const currentContent = entries.join(ENTRY_DELIMITER);
+  let currentContent = entries.join(ENTRY_DELIMITER);
   const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
+
+  // ponytail: skip LLM when already well under cap after cheap dedupe+squeeze — keeps IDs verbatim, saves 120s
+  const cfg = (store as unknown as { config?: { memoryCharLimit?: number; userCharLimit?: number } }).config;
+  const limitForSkip = target === "failure" ? (cfg?.memoryCharLimit ?? 5000) * 2 : target === "user" ? (cfg?.userCharLimit ?? 5000) : (cfg?.memoryCharLimit ?? 5000);
+  if (currentContent.length > 0 && currentContent.length < limitForSkip * 0.8) {
+    appendConsolidationLog(`[hermes-memory] consolidate skip — under 80% cap (${currentContent.length}/${limitForSkip}) for ${toolTarget}, dedupe+squeeze already tidy`);
+    await resyncSqliteAfterConsolidation(dbManager);
+    return { consolidated: true };
+  }
 
   appendConsolidationLog(
     `[hermes-memory] consolidate start target=${toolTarget} entries=${entries.length} chars=${currentContent.length} timeout=${timeoutMs} transport=${directCtx && usesDirectTransport(llmConfig) ? "direct" : "subprocess"} model=${llmConfig.llmModelOverride?.trim() || "(default)"} thinking=${llmConfig.llmThinkingOverride ?? "(inherit)"} ts=${new Date().toISOString()}`,
@@ -250,6 +259,12 @@ export async function triggerConsolidation(
     // (the LLM cannot summarize 100k+ chars in one pass). Split the entries
     // into small chunks so every child finishes quickly; the children run
     // sequentially under the same lock and each removes only its own slice.
+    // ponytail: topic-sort before chunking — lexicographic sort of normalized entries clusters BiPOS/Session together (80% of lane benefit, 0 storm)
+    {
+      const normForSort = (s: string) => s.replace(/<!--[\s\S]*?-->/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+      entries.sort((a, b) => normForSort(a).localeCompare(normForSort(b)));
+      currentContent = entries.join(ENTRY_DELIMITER);
+    }
     const CHUNK_CHARS = 8000;
     const chunks: string[][] = [];
     let chunk: string[] = [];
