@@ -71,6 +71,7 @@ const DEFAULT_CONFIG: MemoryConfig = {
   nudgeToolCalls: DEFAULT_NUDGE_TOOL_CALLS,
   projectsMemoryDir: DEFAULT_PROJECTS_MEMORY_DIR,
   sessionSearch: { variant: "legacy" },
+  quickCheckOnOpen: true,
 };
 
 export const DEFAULT_CONFIG_PATH = path.join(
@@ -161,6 +162,7 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       ) {
         config.sessionSearch = { variant: parsed.sessionSearch.variant };
       }
+      if (typeof parsed.quickCheckOnOpen === "boolean") config.quickCheckOnOpen = parsed.quickCheckOnOpen;
       if (typeof parsed.llmModelOverride === "string") {
         const trimmed = parsed.llmModelOverride.trim();
         if (trimmed.length > 0) config.llmModelOverride = trimmed;
