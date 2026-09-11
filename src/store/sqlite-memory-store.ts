@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { DatabaseManager } from './db.js';
 import {
   buildFallbackFts5Query,
@@ -7,7 +8,7 @@ import {
   normalizeNaturalLanguageFts5Query,
 } from './fts-query.js';
 import { normalizeMemoryLookupText } from './memory-lookup.js';
-import { DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT } from '../constants.js';
+import { DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT, MDSYNC_METADATA_KEY_PREFIX } from '../constants.js';
 import type { MemoryCategory } from '../types.js';
 
 const MEMORY_SELECT_COLUMNS = `
@@ -85,6 +86,37 @@ export interface MarkdownMemoryReconcileResult {
   inserted: number;
   existing: number;
   removed: number;
+}
+
+export interface MarkdownReconcileOptions {
+  /** Repair path. Ignore stored fingerprint and rewrite the scope. */
+  force?: boolean;
+}
+
+interface MarkdownScopeSyncState {
+  sha256: string;
+  entryCount: number;
+}
+
+function markdownScopeSyncKey(target: string, project: string | null): string {
+  return MDSYNC_METADATA_KEY_PREFIX + JSON.stringify([target, project]);
+}
+
+function parseMarkdownScopeSyncState(value: unknown): MarkdownScopeSyncState | null {
+  if (typeof value !== 'string') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const rec = parsed as Record<string, unknown>;
+  if (Object.keys(rec).length !== 2) return null;
+  const { sha256, entryCount } = rec;
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(sha256)) return null;
+  if (typeof entryCount !== 'number' || !Number.isInteger(entryCount) || entryCount < 0) return null;
+  return { sha256, entryCount };
 }
 
 export interface ParsedMarkdownMemoryEntry extends SqliteMemorySyncInput {}
@@ -453,11 +485,42 @@ export function reconcileMarkdownMemoryScope(
   rawEntries: string[],
   target: 'memory' | 'user' | 'failure',
   project: string | null = null,
+  options?: MarkdownReconcileOptions,
 ): MarkdownMemoryReconcileResult {
   const db = dbManager.getDb();
   const normalizedProject = normalizeNullable(project);
+  const syncKey = markdownScopeSyncKey(target, normalizedProject);
+  const hash = createHash('sha256').update(JSON.stringify(rawEntries)).digest('hex');
+  const force = options?.force === true;
 
   const reconcile = (): MarkdownMemoryReconcileResult => {
+    const db = dbManager.getDb();
+
+    // Read the fingerprint row on the force path too: an emptying scope needs it
+    // to know whether a stale row is worth deleting, and force is the repair
+    // command, where one indexed read costs nothing.
+    const stateRow = db.prepare(
+      'SELECT value FROM extension_metadata WHERE key = ?',
+    ).get(syncKey) as { value: string } | undefined;
+    const state = parseMarkdownScopeSyncState(stateRow?.value);
+    if (!force && state && state.sha256 === hash) {
+      // Liveness here is a row COUNT over this scope's slice: the fingerprint
+      // binds markdown bytes, not the mirror's content, so a mirror that drifted
+      // without changing its row count keeps skipping. That is the deliberate
+      // trade for the per-startup sweep this gate removes; the forced
+      // /memory-sync-markdown reconcile is the repair for every such drift,
+      // including a search index that lost rows.
+      const countParams: unknown[] = [];
+      const countConditions = buildScopeConditions(countParams, target, normalizedProject);
+      const countRow = db.prepare(
+        `SELECT COUNT(*) as count FROM memories WHERE ${countConditions.join(' AND ')}`,
+      ).get(...countParams) as { count: number } | undefined;
+      const count = Number(countRow?.count ?? 0);
+      if (count === state.entryCount) {
+        return { inserted: 0, existing: state.entryCount, removed: 0 };
+      }
+    }
+
     let inserted = 0;
     let existing = 0;
     const desiredIdentities = new Set<string>();
@@ -498,6 +561,19 @@ export function reconcileMarkdownMemoryScope(
       removed = db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...orphanIds).changes;
     }
 
+    const unique = desiredIdentities.size;
+    if (unique === 0) {
+      // Only a scope that previously had a fingerprint needs the delete; an
+      // always-empty scope costs two reads, never a write transaction.
+      if (state) {
+        db.prepare('DELETE FROM extension_metadata WHERE key = ?').run(syncKey);
+      }
+    } else {
+      db.prepare(
+        'INSERT OR REPLACE INTO extension_metadata (key, value) VALUES (?, ?)',
+      ).run(syncKey, JSON.stringify({ sha256: hash, entryCount: unique }));
+    }
+
     return { inserted, existing, removed };
   };
 
@@ -512,6 +588,7 @@ function failureProject(rawEntry: string): string | null {
 export function reconcileMarkdownFailureScopes(
   dbManager: DatabaseManager,
   rawEntries: string[],
+  options?: MarkdownReconcileOptions,
 ): MarkdownMemoryReconcileResult {
   const entriesByProject = new Map<string | null, string[]>();
   for (const rawEntry of rawEntries) {
@@ -539,6 +616,7 @@ export function reconcileMarkdownFailureScopes(
       entriesByProject.get(project) ?? [],
       'failure',
       project,
+      options,
     );
     total.inserted += result.inserted;
     total.existing += result.existing;
