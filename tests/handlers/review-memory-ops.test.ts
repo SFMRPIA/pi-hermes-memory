@@ -180,20 +180,18 @@ describe("applyReviewOperations", () => {
 
 describe("provider auth freshness", () => {
   /**
-   * Mirrors AuthStorage: `disk` is auth.json, `loaded` is the in-memory
-   * snapshot, and only reload() copies one onto the other. A rotation tool
-   * rewrites `disk`; a session that never reloads keeps sending `loaded`.
+   * Mirrors AuthStorage as of pi 0.99.x: every getApiKeyAndHeaders call
+   * revision-checks auth.json and re-reads it when the file changed, so the
+   * mock reads `disk` on every call. A rotation tool rewrites `disk`; the
+   * next credential read picks the new key up.
    */
   function rotatingRegistry(initialKey: string) {
-    const state = { disk: initialKey, loaded: initialKey, reloads: 0 };
+    const state = { disk: initialKey, reads: 0 };
     const modelRegistry = {
-      authStorage: {
-        reload: () => {
-          state.reloads++;
-          state.loaded = state.disk;
-        },
+      getApiKeyAndHeaders: async () => {
+        state.reads++;
+        return { ok: true as const, apiKey: state.disk };
       },
-      getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: state.loaded }),
       getAll: () => [mockModel(false)],
       getAvailable: () => [mockModel(false)],
     };
@@ -236,8 +234,8 @@ describe("provider auth freshness", () => {
     );
 
     assert.strictEqual(result.ok, true);
-    assert.strictEqual(state.reloads, 1, "credentials must be re-read, not taken from the startup snapshot");
-    assert.deepStrictEqual(usedKeys, ["rotated-key"], "the stale snapshot key must never reach the provider");
+    assert.strictEqual(state.reads, 1, "credentials must be resolved fresh per completion, not cached");
+    assert.deepStrictEqual(usedKeys, ["rotated-key"], "the rotated key must reach the provider");
   });
 
   it("retries once with the rotated key when the provider rejects the current one", async () => {
@@ -280,25 +278,6 @@ describe("provider auth freshness", () => {
     assert.strictEqual(result.ok, false);
     assert.strictEqual(result.fallbackReason, "provider_error");
     assert.strictEqual(usedKeys.length, 1, "an unchanged key means a real auth problem, not a rotation race");
-  });
-
-  it("keeps working when reloading the credential file throws", async () => {
-    const { modelRegistry } = rotatingRegistry("only-key");
-    modelRegistry.authStorage.reload = () => { throw new Error("auth.json is not valid JSON"); };
-    const { usedKeys, complete } = completionStub(() => emptyOperations);
-
-    const result = await runDirectMemoryCompletion(
-      { model: mockModel(false), modelRegistry } as never,
-      null as never,
-      null,
-      directOptions(),
-      null,
-      null,
-      { completeSimple: complete as never },
-    );
-
-    assert.strictEqual(result.ok, true);
-    assert.deepStrictEqual(usedKeys, ["only-key"]);
   });
 
   it("classifies provider auth rejections without swallowing other failures", () => {
