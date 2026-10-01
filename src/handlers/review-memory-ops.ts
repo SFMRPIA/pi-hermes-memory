@@ -36,6 +36,9 @@ export interface RunDirectMemoryCompletionOptions {
   config: Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride">;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Pi session id for OpenCode-gated direct completions (#250); callers with
+   * a sessionManager compute it via readSessionId — absent = no header. */
+  sessionId?: string | undefined;
 }
 
 /** Shared transport gate: review/flush/consolidation/correction all default to
@@ -86,6 +89,65 @@ function effectiveThinkingOverride(config: ReviewLlmConfig): ThinkingLevel | und
 
 type ReviewModelRegistry = ExtensionContext["modelRegistry"];
 
+// Session attribution for OpenCode-gated direct completions (#250, upstream
+// #259): the direct transport calls completeSimple itself, so it bypasses the
+// session plumbing Pi applies to its own completions, and the OpenCode gateway
+// rejects such completions with 400 missing_session_id before the model runs.
+// Restated from pi-coding-agent's internal provider-attribution (v0.87.1):
+// re-check when bumping the pi-ai floor past 0.86.0.
+const OPENCODE_SESSION_HEADER = "x-opencode-session";
+const OPENCODE_CLIENT_HEADER = "x-opencode-client";
+const OPENCODE_HOST = "opencode.ai";
+
+export type ReviewSessionManager = Pick<ExtensionContext, "sessionManager">["sessionManager"];
+
+function matchesHost(baseUrl: string | undefined, expectedHost: string): boolean {
+  try {
+    return new URL(baseUrl ?? "").hostname === expectedHost;
+  } catch {
+    return false;
+  }
+}
+
+/** A missing session id degrades to the pre-#250 behaviour: the attempt still
+ * goes out, and the subprocess fallback owns recovery. */
+export function readSessionId(sessionManager: ReviewSessionManager): string | undefined {
+  try {
+    return sessionManager.getSessionId() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Returns a copy whenever a header is added: the registry hands out a shared
+ * object, and the credential-rotation comparison below must not read hermes'
+ * own header as a credential change.
+ *
+ * An operator-configured session header short-circuits both additions, so that
+ * request carries no client header. pi keeps its client header in that case.
+ * The divergence is deliberate, because honouring the operator's session id
+ * completely is the more predictable contract. */
+function directRequestHeaders(
+  model: Model<Api>,
+  headers: ProviderHeaders | undefined,
+  sessionId: string | undefined,
+): ProviderHeaders | undefined {
+  if (!sessionId) return headers;
+  const isOpenCode = model.provider === "opencode"
+    || model.provider === "opencode-go"
+    || matchesHost(model.baseUrl, OPENCODE_HOST);
+  if (!isOpenCode) return headers;
+  const alreadySet = Object.keys(headers ?? {}).some(
+    (key) => key.toLowerCase() === OPENCODE_SESSION_HEADER,
+  );
+  if (alreadySet) return headers;
+  return {
+    ...headers,
+    [OPENCODE_SESSION_HEADER]: sessionId,
+    [OPENCODE_CLIENT_HEADER]: "pi",
+  };
+}
+
 export function buildDirectReviewCompletionOptions(
   model: Model<Api>,
   auth: {
@@ -95,10 +157,11 @@ export function buildDirectReviewCompletionOptions(
   },
   thinking: ThinkingLevel | undefined,
   signal: AbortSignal,
+  sessionId?: string | undefined,
 ): SimpleStreamOptions {
   const options: SimpleStreamOptions = {
     apiKey: auth.apiKey,
-    headers: auth.headers,
+    headers: directRequestHeaders(model, auth.headers, sessionId),
     env: auth.env,
     signal,
   };
@@ -396,7 +459,7 @@ export async function runDirectMemoryCompletion(
       response = await complete(
         model,
         request,
-        buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal),
+        buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal, options.sessionId),
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -413,7 +476,7 @@ export async function runDirectMemoryCompletion(
       response = await complete(
         model,
         request,
-        buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal),
+        buildDirectReviewCompletionOptions(model, requestAuth, thinking, controller.signal, options.sessionId),
       );
     }
 

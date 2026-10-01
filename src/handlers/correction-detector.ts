@@ -23,7 +23,7 @@ import {
 import type { MemoryConfig } from "../types.js";
 import { getMessageText } from "../types.js";
 import { execChildPrompt } from "./pi-child-process.js";
-import { runDirectMemoryCompletion, usesDirectTransport } from "./review-memory-ops.js";
+import { runDirectMemoryCompletion, readSessionId, usesDirectTransport } from "./review-memory-ops.js";
 
 /**
  * Extract the directive part from a correction message.
@@ -231,6 +231,7 @@ export function setupCorrectionDetector(
               config,
               timeoutMs: 30000,
               signal: ctx.signal,
+              sessionId: readSessionId(ctx.sessionManager),
             },
             dbManager,
             projectName,

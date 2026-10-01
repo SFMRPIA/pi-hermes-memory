@@ -302,3 +302,79 @@ describe("provider auth freshness", () => {
     }
   });
 });
+
+// Ported from upstream #259/#250 — adapted to the fork's signature
+// (sessionId passed via RunDirectMemoryCompletionOptions / explicit param).
+describe("opencode session header (#250)", () => {
+  function opencodeModel(provider: string, baseUrl?: string): Model<Api> {
+    return {
+      id: "test-model",
+      provider,
+      api: "openai-completions",
+      reasoning: false,
+      ...(baseUrl ? { baseUrl } : {}),
+    } as Model<Api>;
+  }
+
+  it("scopes by provider id and host, and adds no header for foreign providers", () => {
+    const auth = { apiKey: "sk-test", headers: { "X-Test": "1" } };
+    const signal = new AbortController().signal;
+
+    // opencode provider → header added, other headers preserved.
+    assert.deepStrictEqual(
+      buildDirectReviewCompletionOptions(opencodeModel("opencode"), auth, undefined, signal, "sess-1").headers,
+      { "X-Test": "1", "x-opencode-session": "sess-1", "x-opencode-client": "pi" },
+    );
+    // opencode-go provider → header added.
+    assert.ok(
+      "x-opencode-session" in (buildDirectReviewCompletionOptions(opencodeModel("opencode-go"), auth, undefined, signal, "sess-1").headers ?? {}),
+    );
+    // Foreign provider on the opencode.ai host → header added.
+    assert.ok(
+      "x-opencode-session" in (buildDirectReviewCompletionOptions(opencodeModel("other", "https://opencode.ai/v1"), auth, undefined, signal, "sess-1").headers ?? {}),
+    );
+    // Foreign provider, foreign host → untouched.
+    assert.deepStrictEqual(
+      buildDirectReviewCompletionOptions(opencodeModel("other", "https://api.example.com/v1"), auth, undefined, signal, "sess-1").headers,
+      { "X-Test": "1" },
+    );
+  });
+
+  it("keeps an operator-configured session header instead of overwriting it", () => {
+    const auth = { apiKey: "sk-test", headers: { "X-Opencode-Session": "operator-session" } };
+    const options = buildDirectReviewCompletionOptions(
+      opencodeModel("opencode"),
+      auth,
+      undefined,
+      new AbortController().signal,
+      "hermes-session",
+    );
+    assert.strictEqual(options.headers?.["X-Opencode-Session"], "operator-session");
+    assert.ok(!("x-opencode-client" in (options.headers ?? {})));
+  });
+
+  it("adds no header when the session id is empty", () => {
+    const auth = { apiKey: "sk-test", headers: { "X-Test": "1" } };
+    const options = buildDirectReviewCompletionOptions(
+      opencodeModel("opencode"),
+      auth,
+      undefined,
+      new AbortController().signal,
+      undefined,
+    );
+    assert.deepStrictEqual(options.headers, { "X-Test": "1" });
+  });
+
+  it("returns the same object reference when no header is added (no copy churn)", () => {
+    const headers = { "X-Test": "1" };
+    const auth = { apiKey: "sk-test", headers };
+    const options = buildDirectReviewCompletionOptions(
+      opencodeModel("other", "https://api.example.com"),
+      auth,
+      undefined,
+      new AbortController().signal,
+      "sess-1",
+    );
+    assert.strictEqual(options.headers, headers);
+  });
+});
