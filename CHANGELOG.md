@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — fork port of upstream v0.9.7–v0.9.9 Tier 1
+
+### Fixed
+
+- **`memory_search` accepts `target: "project"`** (upstream [#213](https://github.com/chandra447/pi-hermes-memory/pull/213)): schema + search SQL now accept the fourth target value, resolving to `target = 'memory' AND project IS NOT NULL`, matching the `[target=project]` labels the `memory` tool writes; guidance text updated. Includes the short-CJK literal fallback the fix rides on. Fork keeps its own emoji/`[project]` result format and bm25+recency ranking.
+- **`quickCheckOnOpen` setting** (upstream [#220](https://github.com/chandra447/pi-hermes-memory/pull/220)): default `true` (current behavior); `false` skips the async startup `PRAGMA quick_check`. Operation-time corruption recovery stays enabled either way.
+
+### Changed
+
+- **better-sqlite3 `^13.0.3`** (upstream [#205](https://github.com/chandra447/pi-hermes-memory/pull/205)): clean process exit on Node 24 (12.x ObjectWrap destructor could SIGABRT at shutdown after all work completed).
+
+### Performance
+
+- **Startup markdown→SQLite reconcile is fingerprint-gated per scope** (upstream [#227](https://github.com/chandra447/pi-hermes-memory/issues/227) / [#233](https://github.com/chandra447/pi-hermes-memory/pull/233)): unchanged markdown scopes skip per-entry SQL (upstream measured 2.1–7.2 s per startup on large stores); fingerprint (markdown bytes + row count) lives in `extension_metadata`, written in the same transaction as the reconcile; `/memory-sync-markdown` remains the forced full repair. Brings `src/lifecycle-timing.ts` (PI_TIMING-gated utility) as the commit's dependency. Not ported: the FTS-degradation test path — it requires upstream #184's error-degradation behavior, which is out of Tier-1 scope.
+
+### Added
+
+- **`x-opencode-session` header on direct background completions** (upstream [#250](https://github.com/chandra447/pi-hermes-memory/issues/250) / [#259](https://github.com/chandra447/pi-hermes-memory/pull/259)): review/flush/correction direct transports send the real Pi session id, scoped to `opencode`/`opencode-go` providers + `opencode.ai` host, so the OpenCode gateway stops rejecting them with `400 missing_session_id`; an operator-configured session header wins and is never overwritten; a missing session id degrades to the previous behavior. Adapted to the fork's signatures (sessionId flows via `RunDirectMemoryCompletionOptions`).
+
 ## [0.9.2] - 2026-07-30
 
 ### Fixed
