@@ -16,6 +16,12 @@ export const DEFAULT_USER_CHAR_LIMIT = 5000;
 
 // ─── Learning loop defaults ───
 export const DEFAULT_PROJECT_CHAR_LIMIT = 5000;
+/**
+ * Largest session message stored in SQLite. Tool results are excluded during
+ * parsing, but this cap also protects the database from unexpected large text
+ * blocks in future Pi content formats.
+ */
+export const DEFAULT_MAX_MESSAGE_CONTENT_LENGTH = 100 * 1024;
 
 export const DEFAULT_NUDGE_INTERVAL = 10;
 export const DEFAULT_FLUSH_MIN_TURNS = 6;
@@ -225,6 +231,8 @@ export const DIRECT_CONSOLIDATION_SYSTEM_PROMPT = `The memory store you're given
 - Remove outdated or superseded entries (entries older than 30 days without recent references are candidates for removal)
 - Keep the most important and frequently-referenced facts
 - Preserve user preferences and corrections (highest priority)
+- Preserve exact identifiers verbatim — store codes, SKUs, IDs, filenames, paths, error codes/messages, and numbers must be kept exactly as written; do not reword, round, or drop them
+- When merging, keep all unique identifiers from source entries and summarize only the surrounding prose; do not invent identifiers
 
 Each entry shows when it was created and last referenced in HTML comments (<!-- created=..., last=... -->). Use this to identify stale entries.
 
@@ -255,6 +263,8 @@ export const CONSOLIDATION_PROMPT = `The memory is at capacity. Review the curre
 - Remove outdated or superseded entries (entries older than 30 days without recent references are candidates for removal)
 - Keep the most important and frequently-referenced facts
 - Preserve user preferences and corrections (highest priority)
+- Preserve exact identifiers verbatim — store codes, SKUs, IDs, filenames, paths, error codes/messages, and numbers must be kept exactly as written; do not reword, round, or drop them
+- When merging, keep all unique identifiers from source entries and summarize only the surrounding prose; do not invent identifiers
 
 Each entry shows when it was created and last referenced in HTML comments (<!-- created=..., last=... -->). Use this to identify stale entries.
 

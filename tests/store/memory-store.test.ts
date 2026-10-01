@@ -288,6 +288,67 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(raw.includes(existing));
     });
 
+    it("includes current entries in memoryFullError response under reject strategy", async () => {
+      const store = new MemoryStore(makeConfig({
+        memoryCharLimit: 140,
+        memoryOverflowStrategy: "reject",
+      }));
+      await store.loadFromDisk();
+
+      const first = `${TEST_MARKER} first`;
+      const second = `${TEST_MARKER} second`;
+      assert.ok((await store.add("memory", first)).success);
+      assert.ok((await store.add("memory", second)).success);
+
+      const result = await store.add("memory", `${TEST_MARKER} ${"x".repeat(100)}`);
+      await settle();
+
+      assert.ok(!result.success);
+      assert.match(result.error ?? "", /see the entries list below/);
+      assert.equal(result.target, "memory");
+      assert.match(result.usage ?? "", /^\d+\/140 chars$/);
+      assert.equal(result.entry_count, 2);
+      assert.deepEqual(result.entries, [first, second]);
+
+      // Metadata comments must not leak into the decoded entries (#178 regression)
+      for (const entry of result.entries ?? []) {
+        assert.ok(!entry.includes("<!--"), "decoded entry must not leak metadata comment");
+        assert.ok(!entry.includes("created="), "decoded entry must not leak created metadata");
+      }
+    });
+
+    it("includes current entries in memoryFullError response when fifo-evict cannot fit the new entry", async () => {
+      const store = new MemoryStore(makeConfig({
+        memoryCharLimit: 80,
+        memoryOverflowStrategy: "fifo-evict",
+      }));
+      await store.loadFromDisk();
+
+      const existing = `${TEST_MARKER} keep me`;
+      assert.ok((await store.add("memory", existing)).success);
+
+      const result = await store.add("memory", `${TEST_MARKER} ${"x".repeat(120)}`);
+      await settle();
+
+      assert.ok(!result.success);
+      assert.match(result.error ?? "", /see the entries list below/);
+      assert.equal(result.target, "memory");
+      assert.match(result.usage ?? "", /^\d+\/80 chars$/);
+      assert.equal(result.entry_count, 1);
+      assert.deepEqual(result.entries, [existing]);
+
+      // Metadata comments must not leak into the decoded entries (#178 regression)
+      for (const entry of result.entries ?? []) {
+        assert.ok(!entry.includes("<!--"), "decoded entry must not leak metadata comment");
+        assert.ok(!entry.includes("created="), "decoded entry must not leak created metadata");
+      }
+
+      // Existing entry must remain on disk — fifo-evict rotated nothing because
+      // the new entry alone exceeds the limit.
+      const raw = await readRaw(memoryPath);
+      assert.ok(raw.includes(existing));
+    });
+
     it("returns error for empty content", async () => {
       const store = new MemoryStore(makeConfig());
 
@@ -1122,11 +1183,11 @@ describe("MemoryStore", { concurrency: 1 }, () => {
         await handle.close();
       }
 
-      const siblings = await fs.readdir(MEMORY_DIR);
+      const siblings = await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []);
       const recoveryFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.recovery-`));
       assert.ok(recoveryFiles.length > 0);
       const recovered = await Promise.all(
-        recoveryFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+        recoveryFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, ".recovery", name), "utf-8")),
       );
       assert.ok(recovered.some((content) => content.includes("late descriptor editor")));
     });
@@ -1155,10 +1216,10 @@ describe("MemoryStore", { concurrency: 1 }, () => {
           new RegExp(`injected displaced verification failure ${failureRead}`),
         );
 
-        const siblings = await fs.readdir(MEMORY_DIR);
+        const siblings = await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []);
         const recoveryFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.recovery-`));
         const recovered = await Promise.all(
-          recoveryFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+          recoveryFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, ".recovery", name), "utf-8")),
         );
         assert.ok(recovered.some((content) => content.includes(`original before failure ${failureRead}`)));
         assert.match(await readRaw(memoryPath), new RegExp(`original before failure ${failureRead}`));
@@ -1356,10 +1417,10 @@ describe("MemoryStore", { concurrency: 1 }, () => {
 
       await assert.rejects(fs.stat(expiredPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
       assert.equal(await fs.readFile(activePath, "utf-8"), `${TEST_MARKER} active recovery`);
-      const retiredFiles = (await fs.readdir(MEMORY_DIR))
+      const retiredFiles = (await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []))
         .filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
       const retiredContents = await Promise.all(
-        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, ".recovery", name), "utf-8")),
       );
       assert.ok(retiredContents.some((content) => content.includes("expired recovery")));
     });
@@ -1396,9 +1457,9 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       await store.loadFromDisk();
       await store.add("memory", `${TEST_MARKER} triggers recovery pruning`);
 
-      const remaining = (await fs.readdir(MEMORY_DIR))
+      const remaining = (await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []))
         .filter((name) => name.startsWith(`.${MEMORY_FILE}.recovery-`));
-      const retired = (await fs.readdir(MEMORY_DIR))
+      const retired = (await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []))
         .filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
       assert.equal(remaining.length, 32, "only the newest 32 snapshots stay active");
       assert.ok(retired.length >= 8, `the excess snapshots must be retired, got ${retired.length}`);
@@ -1422,10 +1483,10 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       await store.add("memory", `${TEST_MARKER} triggers symlink-safe pruning`);
 
       assert.equal((await fs.lstat(symlinkPath)).isSymbolicLink(), true);
-      const retiredFiles = (await fs.readdir(MEMORY_DIR))
+      const retiredFiles = (await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []))
         .filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
       const retiredContents = await Promise.all(
-        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, ".recovery", name), "utf-8")),
       );
       assert.equal(retiredContents.some((content) => content.includes("outside sensitive content")), false);
     });
@@ -1447,10 +1508,10 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       await store.loadFromDisk();
       await store.add("memory", `${TEST_MARKER} triggers retired pruning`);
 
-      const siblings = await fs.readdir(MEMORY_DIR);
+      const siblings = await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []);
       const retiredFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
       const retiredStats = await Promise.all(
-        retiredFiles.map((name) => fs.stat(path.join(MEMORY_DIR, name))),
+        retiredFiles.map((name) => fs.stat(path.join(MEMORY_DIR, ".recovery", name))),
       );
       assert.ok(!retiredFiles.includes(path.basename(staleRetiredPath)));
       assert.ok(retiredFiles.length <= 32);
@@ -1460,23 +1521,17 @@ describe("MemoryStore", { concurrency: 1 }, () => {
     it("bounds generated conflict artifacts without following lookalike symlinks", async () => {
       const externalPath = path.join(MEMORY_DIR, "outside-conflict-data");
       await writeRaw(externalPath, `${TEST_MARKER} outside data`);
-      const symlinkPath = path.join(
-        MEMORY_DIR,
-        `.${MEMORY_FILE}.conflict-local-${Date.now()}-${randomUUID()}`,
+      const symlinkPath = path.join(MEMORY_DIR, ".recovery", `.${MEMORY_FILE}.conflict-local-${Date.now()}-${randomUUID()}`,
       );
       if (process.platform !== "win32") await fs.symlink(externalPath, symlinkPath, "file");
 
       for (let index = 0; index < 40; index++) {
-        const conflictPath = path.join(
-          MEMORY_DIR,
-          `.${MEMORY_FILE}.conflict-local-${Date.now() - index}-${randomUUID()}`,
+        const conflictPath = path.join(MEMORY_DIR, ".recovery", `.${MEMORY_FILE}.conflict-local-${Date.now() - index}-${randomUUID()}`,
         );
         await writeRaw(conflictPath, `${TEST_MARKER} conflict ${index}`);
         await fs.truncate(conflictPath, 2 * 1024 * 1024);
       }
-      const stalePath = path.join(
-        MEMORY_DIR,
-        `.${MEMORY_FILE}.conflict-local-${Date.now()}-${randomUUID()}`,
+      const stalePath = path.join(MEMORY_DIR, ".recovery", `.${MEMORY_FILE}.conflict-local-${Date.now()}-${randomUUID()}`,
       );
       await writeRaw(stalePath, `${TEST_MARKER} stale conflict`);
       const stale = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
@@ -1486,11 +1541,11 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       await store.loadFromDisk();
       await store.add("memory", `${TEST_MARKER} triggers conflict pruning`);
 
-      const names = await fs.readdir(MEMORY_DIR);
+      const names = await fs.readdir(path.join(MEMORY_DIR, ".recovery")).catch(() => []);
       const conflicts = names.filter((name) => /^\.MEMORY\.md\.conflict-local-\d+-[0-9a-f-]{36}$/.test(name));
       const regularConflicts = [];
       for (const name of conflicts) {
-        const artifactPath = path.join(MEMORY_DIR, name);
+        const artifactPath = path.join(MEMORY_DIR, ".recovery", name);
         if ((await fs.lstat(artifactPath)).isFile()) regularConflicts.push(artifactPath);
       }
       const stats = await Promise.all(regularConflicts.map((artifactPath) => fs.stat(artifactPath)));

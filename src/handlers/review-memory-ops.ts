@@ -2,7 +2,7 @@
  * Parse and apply structured memory operations from direct background review.
  */
 
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, ProviderHeaders } from "@earendil-works/pi-ai";
 import { completeSimple, type Message, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "../store/memory-store.js";
@@ -90,7 +90,7 @@ export function buildDirectReviewCompletionOptions(
   model: Model<Api>,
   auth: {
     apiKey: string;
-    headers?: Record<string, string>;
+    headers?: ProviderHeaders;
     env?: Record<string, string>;
   },
   thinking: ThinkingLevel | undefined,
@@ -146,33 +146,29 @@ export function isAuthRejection(message: string): boolean {
  * shape against the real registry at the call below, so drift is a build error.
  */
 export type ResolvedRequestAuth =
-  | { ok: true; apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> }
+  | { ok: true; apiKey?: string; headers?: ProviderHeaders; env?: Record<string, string> }
   | { ok: false; error: string };
 
 /**
- * Resolve request auth against credentials re-read from disk.
+ * Resolve request auth with credentials as fresh as the host allows.
  *
- * Pi's AuthStorage parses auth.json once in its constructor and only reloads
- * it when an OAuth refresh fails, and ExtensionRunner hands every event the
- * same ModelRegistry singleton — so an api_key credential is effectively
- * frozen for the process lifetime. A key rotated on disk by another tool
- * (e.g. @lnilluv/pi-opencode-go-rotation swapping an opencode-go subscription
- * key after a weekly limit) stays invisible to this session, and every direct
- * memory completion keeps presenting the revoked key (#139).
+ * Through pi 0.80.x, AuthStorage parsed auth.json once in its constructor and
+ * only reloaded it when an OAuth refresh failed — so an api_key credential was
+ * effectively frozen for the process lifetime, and a key rotated on disk by
+ * another tool (e.g. @lnilluv/pi-opencode-go-rotation swapping an opencode-go
+ * subscription key after a weekly limit) stayed invisible to this session
+ * (#139). We worked around that by calling the then-public
+ * ModelRegistry.authStorage.reload() before each completion.
  *
- * reload() is public and is a synchronous re-read of that one file, so pay it
- * per completion — a handful per session — instead of caching a key forever.
+ * Since pi 0.99.x, AuthStorage.read() revision-checks auth.json on every read
+ * and reloads automatically when the file changed, and ModelRegistry no longer
+ * exposes authStorage — so getApiKeyAndHeaders alone now yields rotated keys,
+ * and this wrapper only keeps the fresh-read name and call seam.
  */
 export async function resolveFreshRequestAuth(
   modelRegistry: ReviewModelRegistry,
   model: Model<Api>,
 ): Promise<ResolvedRequestAuth> {
-  try {
-    modelRegistry.authStorage?.reload();
-  } catch {
-    // A malformed or unreadable auth.json must not take the review path down;
-    // fall through to whatever credentials are already loaded.
-  }
   return modelRegistry.getApiKeyAndHeaders(model);
 }
 

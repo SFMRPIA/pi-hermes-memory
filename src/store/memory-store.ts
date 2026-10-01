@@ -42,6 +42,34 @@ const CONFLICT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const CONFLICT_MAX_COUNT = 32;
 const CONFLICT_MAX_BYTES = 64 * 1024 * 1024;
 
+// ponytail: Windows EPERM fallback — hard-link publish fails when pi holds file open; copyFile fallback keeps atomic-enough behavior
+async function tryLinkOrCopy(src: string, dest: string): Promise<void> {
+  try {
+    await fs.link(src, dest);
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+      await fs.copyFile(src, dest);
+    } else {
+      throw e;
+    }
+  }
+}
+
+async function tryRenameOrCopy(src: string, dest: string): Promise<void> {
+  try {
+    await fs.rename(src, dest);
+  } catch (e: unknown) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
+      await fs.copyFile(src, dest);
+      await fs.unlink(src);
+    } else {
+      throw e;
+    }
+  }
+}
+
 class ExternalMemoryWriteConflict extends Error {}
 
 export class MemoryStore {
@@ -402,7 +430,7 @@ export class MemoryStore {
       // Consolidation children are spawned with a @prompt-file argument; their
       // fresh MemoryStore has an empty cooldown map, so an over-cap write inside
       // the child would re-trigger consolidation forever (grandchild storm).
-      if (process.argv.some((arg) => arg.startsWith("@"))) return;
+      if (process.argv.some((arg) => arg.startsWith("@"))) return accepted;
       if (Date.now() - lastAttempt >= DEFAULT_CONSOLIDATION_COOLDOWN_MS) {
         this.pendingConsolidations.add(target);
         void this.consolidateInBackground(target);
@@ -467,9 +495,14 @@ export class MemoryStore {
   private memoryFullError(target: "memory" | "user" | "failure", contentLength: number): MemoryResult {
     const current = this.charCount(target);
     const limit = this.charLimit(target);
+    const entries = this.entriesFor(target).map((raw) => this.decodeEntry(raw).text);
     return {
       success: false,
-      error: `Memory at ${current}/${limit} chars. Adding this entry (${contentLength} chars) would exceed the limit. Replace or remove existing entries first.`,
+      error: `Memory at ${current}/${limit} chars. Adding this entry (${contentLength} chars) would exceed the limit. Replace or remove existing entries first (see the entries list below), then retry this add — all in this turn.`,
+      target,
+      usage: `${current}/${limit} chars`,
+      entry_count: entries.length,
+      entries,
     };
   }
 
@@ -871,7 +904,7 @@ export class MemoryStore {
 
       if (expectedFingerprint === "missing") {
         try {
-          await fs.link(tmpPath, filePath);
+          await tryLinkOrCopy(tmpPath, filePath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "EEXIST") {
             throw new ExternalMemoryWriteConflict();
@@ -879,10 +912,11 @@ export class MemoryStore {
           throw error;
         }
       } else {
+        await this.ensureRecoveryDir(filePath);
         const recoveryPath = this.recoveryPathFor(filePath);
         const publishedIdentity = await this.fileIdentity(tmpPath);
         try {
-          await fs.rename(filePath, recoveryPath);
+          await tryRenameOrCopy(filePath, recoveryPath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             throw new ExternalMemoryWriteConflict();
@@ -896,7 +930,7 @@ export class MemoryStore {
             throw new ExternalMemoryWriteConflict();
           }
 
-          await fs.link(tmpPath, filePath);
+          await tryLinkOrCopy(tmpPath, filePath);
           published = true;
 
           const verifiedDisplacedState = await this.readFileState(recoveryPath);
@@ -954,7 +988,7 @@ export class MemoryStore {
 
   private async restoreDisplacedFile(displacedPath: string, filePath: string): Promise<void> {
     try {
-      await fs.link(displacedPath, filePath);
+      await tryLinkOrCopy(displacedPath, filePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
@@ -977,12 +1011,13 @@ export class MemoryStore {
     filePath: string,
     publishedIdentity: { dev: number; ino: number },
   ): Promise<void> {
+    await this.ensureRecoveryDir(filePath);
     const conflictPath = path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.conflict-local-${Date.now()}-${randomUUID()}`,
     );
     try {
-      await fs.rename(filePath, conflictPath);
+      await tryRenameOrCopy(filePath, conflictPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       await this.restoreDisplacedFile(displacedPath, filePath);
@@ -996,22 +1031,30 @@ export class MemoryStore {
     }
 
     try {
-      await fs.link(conflictPath, filePath);
+      await tryLinkOrCopy(conflictPath, filePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
   }
 
+  private recoveryDirFor(filePath: string): string {
+    return path.join(path.dirname(filePath), ".recovery");
+  }
+
+  private async ensureRecoveryDir(filePath: string): Promise<void> {
+    await fs.mkdir(this.recoveryDirFor(filePath), { recursive: true });
+  }
+
   private recoveryPathFor(filePath: string): string {
     return path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.recovery-${Date.now()}-${randomUUID()}`,
     );
   }
 
   private retiredRecoveryPathFor(filePath: string): string {
     return path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.retired-${Date.now()}-${randomUUID()}`,
     );
   }
@@ -1021,7 +1064,25 @@ export class MemoryStore {
   }
 
   private async pruneRecoveryFiles(filePath: string): Promise<void> {
-    const directory = path.dirname(filePath);
+    const directory = this.recoveryDirFor(filePath);
+    const legacyDirectory = path.dirname(filePath);
+    // Migrate legacy dotfiles from parent dir into .recovery/ (one-time, before prune)
+    try {
+      await this.ensureRecoveryDir(filePath);
+      const escapedLegacy = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const uuidLegacy = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+      const legacyRecovery = new RegExp(`^\\.${escapedLegacy}\\.recovery-\\d+-${uuidLegacy}$`, "i");
+      const legacyRetired = new RegExp(`^\\.${escapedLegacy}\\.retired-\\d+-${uuidLegacy}$`, "i");
+      const legacyConflict = new RegExp(`^\\.${escapedLegacy}\\.conflict-local-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`, "i");
+      const legacyNames = await fs.readdir(legacyDirectory).catch(() => [] as string[]);
+      for (const name of legacyNames) {
+        if (legacyRecovery.test(name) || legacyRetired.test(name) || legacyConflict.test(name)) {
+          try { await tryRenameOrCopy(path.join(legacyDirectory, name), path.join(directory, name)); } catch {}
+        }
+      }
+    } catch {}
+    try { await fs.mkdir(directory, { recursive: true }); } catch {}
+    
     const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const uuidPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
     const recoveryPattern = new RegExp(`^\\.${escapedName}\\.recovery-\\d+-${uuidPattern}$`, "i");
@@ -1125,6 +1186,7 @@ export class MemoryStore {
   }
 
   private async retireRecoveryFile(recoveryPath: string, filePath: string): Promise<void> {
+    await this.ensureRecoveryDir(filePath);
     const retiredPath = this.retiredRecoveryPathFor(filePath);
     const snapshotPath = `${retiredPath}.tmp`;
     const snapshot = await fs.readFile(recoveryPath);
@@ -1140,8 +1202,9 @@ export class MemoryStore {
   }
 
   private async preserveConflictFile(sourcePath: string, filePath: string, kind: string): Promise<string> {
+    await this.ensureRecoveryDir(filePath);
     const conflictPath = path.join(
-      path.dirname(filePath),
+      this.recoveryDirFor(filePath),
       `.${path.basename(filePath)}.conflict-${kind}-${Date.now()}-${randomUUID()}`,
     );
     await fs.copyFile(sourcePath, conflictPath);
