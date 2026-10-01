@@ -158,6 +158,21 @@ function buildScopeConditions(params: unknown[], target?: string, project?: stri
   return conditions;
 }
 
+/** Maps memory_search target filters onto SQLite columns (search paths only). */
+function buildSearchTargetConditions(params: unknown[], target: string | undefined, tablePrefix: string): string[] {
+  const conditions: string[] = [];
+
+  if (target === 'project') {
+    conditions.push(`${tablePrefix}.target = 'memory'`);
+    conditions.push(`${tablePrefix}.project IS NOT NULL`);
+  } else if (target) {
+    conditions.push(`${tablePrefix}.target = ?`);
+    params.push(target);
+  }
+
+  return conditions;
+}
+
 function getMemoryById(dbManager: DatabaseManager, id: number): SqliteMemoryEntry | null {
   const db = dbManager.getDb();
   const row = db.prepare(`
@@ -190,6 +205,12 @@ function maxDate(a: string, b: string): string {
 
 function escapeLikePattern(text: string): string {
   return text.replace(/[\\%_]/g, '\\$&');
+}
+
+function isShortCjkLiteralQuery(query: string): boolean {
+  const trimmed = query.trim();
+  return [...trimmed].length <= 2
+    && /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+$/u.test(trimmed);
 }
 
 function parseMetadataComment(raw: string): { text: string; created: string; lastReferenced: string; project: string | null } {
@@ -727,10 +748,7 @@ export function searchMemories(
       }
     }
 
-    if (target) {
-      conditions.push('m.target = ?');
-      params.push(target);
-    }
+    conditions.push(...buildSearchTargetConditions(params, target, 'm'));
 
     if (category) {
       conditions.push('m.category = ?');
@@ -794,9 +812,59 @@ export function searchMemories(
     }
   };
 
+  // FTS5's trigram tokenizer cannot match one- and two-character CJK terms.
+  // Use a scoped literal fallback only for those terms so FTS operators and
+  // normal tokenized searches retain their existing semantics.
+  const runShortCjkFallback = (): SqliteMemoryEntry[] => {
+    const conditions: string[] = ["m.content LIKE ? ESCAPE '\\'"];
+    const params: unknown[] = [`%${escapeLikePattern(query.trim())}%`];
+
+    if (project !== undefined) {
+      if (project === null) {
+        conditions.push('m.project IS NULL');
+      } else {
+        conditions.push('m.project = ?');
+        params.push(project);
+      }
+    }
+    conditions.push(...buildSearchTargetConditions(params, target, 'm'));
+
+    if (category) {
+      conditions.push('m.category = ?');
+      params.push(category);
+    }
+
+    const rows = db.prepare(`
+      SELECT ${MEMORY_SELECT_COLUMNS}
+      FROM memories m
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY m.last_referenced DESC
+      LIMIT ?
+    `).all(...params, limit) as Array<{
+      id: number;
+      project: string | null;
+      target: string;
+      category: string | null;
+      content: string;
+      failure_reason: string | null;
+      tool_state: string | null;
+      corrected_to: string | null;
+      created: string;
+      last_referenced: string;
+    }>;
+    return rows.map(mapRow);
+  };
+
+
   const exactResults = runSearch(normalizedQuery);
   if (exactResults.length > 0) {
     return exactResults;
+  }
+
+  // FTS5's trigram tokenizer cannot match one- and two-character CJK terms;
+  // fall back to the scoped literal search for those.
+  if (isShortCjkLiteralQuery(query)) {
+    return runShortCjkFallback();
   }
 
   // A query with uppercase operator words (e.g. "DO NOT USE FIND /") passes

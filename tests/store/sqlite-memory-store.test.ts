@@ -344,6 +344,36 @@ describe('sqlite-memory-store', () => {
       assert.ok(results.length > 0);
       assert.ok(results.some(r => r.content.includes('Prisma')));
     });
+
+    it('returns only project-attributed memories for target "project"', () => {
+      const results = searchMemories(dbManager, 'Prisma', { target: 'project' });
+
+      assert.ok(results.length > 0);
+      assert.ok(results.every((r) => r.project === 'project-a'));
+      assert.ok(results.every((r) => r.target === 'memory'));
+    });
+
+    it('keeps target "memory" matching both global and project-attributed memories', () => {
+      const global = searchMemories(dbManager, 'pnpm', { target: 'memory' });
+      const project = searchMemories(dbManager, 'Prisma', { target: 'memory' });
+
+      assert.ok(global.some((r) => r.project === null));
+      assert.ok(project.length > 0);
+      assert.ok(project.every((r) => r.project === 'project-a'));
+    });
+
+    it('combines target "project" with an explicit project filter', () => {
+      addMemory(dbManager, 'uses Bun with PostgreSQL', 'memory', 'project-b');
+
+      const named = searchMemories(dbManager, 'PostgreSQL', { target: 'project', project: 'project-b' });
+      const anyProject = searchMemories(dbManager, 'PostgreSQL', { target: 'project' });
+      const globalOnly = searchMemories(dbManager, 'PostgreSQL', { target: 'project', project: null });
+
+      assert.ok(named.length > 0);
+      assert.ok(named.every((r) => r.project === 'project-b'));
+      assert.ok(anyProject.some((r) => r.project === 'project-a'));
+      assert.strictEqual(globalOnly.length, 0);
+    });
     it('finds pure CJK substrings with the trigram tokenizer', () => {
       addMemory(dbManager, '设备清单包含 NAS 和备份策略');
 
@@ -362,10 +392,23 @@ describe('sqlite-memory-store', () => {
       assert.ok(results.some((result) => result.content.includes('NAS')));
     });
 
-    it('documents that one- and two-character queries do not match trigram FTS', () => {
+    it('matches one- and two-character CJK queries via the scoped literal fallback', () => {
       addMemory(dbManager, '设备清单包含 NAS 和备份策略');
 
-      assert.deepStrictEqual(searchMemories(dbManager, '设备'), []);
+      const results = searchMemories(dbManager, '设备');
+      assert.ok(results.length > 0);
+      assert.ok(results.some((result) => result.content.includes('设备')));
+    });
+
+    it('applies target "project" in the CJK literal fallback path', () => {
+      addMemory(dbManager, '项目约定使用 pnpm', 'memory', 'project-a');
+      addMemory(dbManager, '项目全局笔记');
+
+      const results = searchMemories(dbManager, '项目', { target: 'project' });
+
+      assert.ok(results.length > 0);
+      assert.ok(results.every((r) => r.project === 'project-a'));
+      assert.ok(results.every((r) => r.target === 'memory'));
     });
 
 
