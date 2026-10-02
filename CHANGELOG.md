@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Chunked subprocess consolidation (upstream #236)** behind the new `consolidationChunking` flag (default off — upstream's maintainer decision, legacy single-shot stays byte-identical): over-`consolidationChunkChars` stores run bounded goal-driven rounds sharing one overall `consolidationTimeoutMs` budget; the walk advances past consumed slices, skips no-progress slices, runs an unscoped decisive round when the remaining store fits one prompt, reports partial progress (`partial` + `rounds` on `ConsolidationResult`, surfaced by `/memory-consolidate` and the auto-consolidation log), and **reports** out-of-scope deletions instead of resurrecting them. Note: the fork's deterministic squeeze+dedupe pre-pass already keeps over-cap stores under the cap, so the walk is the parity safety net for stores that slip past it (e.g. squeeze disabled by lock contention), not the primary shrink path.
+- **Scoped startup markdown sync (upstream #265)**: session-start reconciles only the global files plus the current project (`onlyProjects`); `/memory-sync-markdown` keeps the full sweep as the repair path. Boot cost no longer scales with the projects-memory folder count.
+- **Skill discovery trigger signals (upstream #244/#249)**: skill-tool `description` guidance now points discovery signals at description (Pi indexes by that field alone); `when_to_use` docs updated to match.
+- **Deferred process-incarnation probe (upstream #247)**: the atomic-lock coordinator no longer probes its own incarnation (a ~0.5–1.4s Windows helper spawn) at module import; it is memoized on first lock use.
+
+### Deliberately skipped
+
+- #258 (capEnforced header gating): the fork enforces caps unconditionally — there is no policy-only label drift to fix.
+- #256 (ambient Bedrock credentials): the fork's `ResolvedRequestAuth` requires an apiKey downstream; porting would rework the auth plumbing for zero value on key-based providers.
+- #273 (pi-tui peer dep): already present in the fork's package.json.
 
 ### Fixed
 
