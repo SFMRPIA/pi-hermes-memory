@@ -15,6 +15,12 @@ import {
 } from "../../src/handlers/review-memory-ops.js";
 import { DatabaseManager } from "../../src/store/db.js";
 import { reconcileMarkdownMemoryScope } from "../../src/store/sqlite-memory-store.js";
+import {
+  DIRECT_CONSOLIDATION_SYSTEM_PROMPT,
+  DIRECT_CORRECTION_SYSTEM_PROMPT,
+  DIRECT_FLUSH_SYSTEM_PROMPT,
+  DIRECT_REVIEW_SYSTEM_PROMPT,
+} from "../../src/constants.js";
 
 function mockModel(reasoning: boolean): Model<Api> {
   return {
@@ -503,5 +509,339 @@ describe("fallback model chain (#215/#219)", () => {
       resolveReviewModels(ctxModel, { getAll: () => [] } as never, {} as never),
       [ctxModel],
     );
+  });
+});
+
+
+describe("thinking-channel recovery + empty_response (#235/#239)", () => {
+  let tmpDir: string;
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "thinking-ops-"));
+  });
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  function freshStore() {
+    return new MemoryStore({
+      memoryDir: tmpDir,
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      autoConsolidate: true,
+    });
+  }
+
+  function okRegistry(model: Model<Api>) {
+    return {
+      getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "k" }),
+      getAll: () => [model],
+      getAvailable: () => [model],
+    };
+  }
+
+  function thinkingOnly(thinkingText: string) {
+    return { stopReason: "stop", content: [{ type: "thinking", thinking: thinkingText }] };
+  }
+
+  function runCtx(registry: unknown) {
+    return { model: mockModel(false), modelRegistry: registry } as never;
+  }
+
+  async function run(
+    store: unknown,
+    config: unknown,
+    complete: unknown,
+    extraDeps: Record<string, unknown> = {},
+  ) {
+    return runDirectMemoryCompletion(
+      runCtx(okRegistry(mockModel(false))),
+      store as never,
+      null,
+      { userPrompt: "u", systemPrompt: "s", config: config as never } as never,
+      null,
+      null,
+      { completeSimple: complete, ...extraDeps } as never,
+    );
+  }
+
+  // ── shared-cascade (text channel) extraction ──
+  it("prefers the last operations object when CoT restates the schema first (#197)", () => {
+    assert.deepStrictEqual(parseReviewOperations(
+      'The schema is {"operations":[]} but I will save:\n{"operations":[{"action":"add","target":"user","content":"prefers dark mode"}]}',
+    ), [{ action: "add", target: "user", content: "prefers dark mode" }]);
+  });
+
+  it("still parses a single object surrounded by prose via the first-to-last slice", () => {
+    assert.deepStrictEqual(parseReviewOperations(
+      'Sure — here it is:\n{"operations":[{"action":"add","target":"user","content":"prefers dark mode"}]}\nDone.',
+    ), [{ action: "add", target: "user", content: "prefers dark mode" }]);
+  });
+
+  it("returns null when no candidate object carries an operations array", () => {
+    assert.strictEqual(parseReviewOperations('checked {"a":1} and {"b":2} — nothing worth saving'), null);
+  });
+
+  it("does not parse live operations out of any direct prompt (schema echo, #197)", () => {
+    for (const prompt of [DIRECT_REVIEW_SYSTEM_PROMPT, DIRECT_FLUSH_SYSTEM_PROMPT, DIRECT_CONSOLIDATION_SYSTEM_PROMPT, DIRECT_CORRECTION_SYSTEM_PROMPT]) {
+      const parsed = parseReviewOperations(prompt);
+      assert.ok(
+        parsed === null || parsed.length === 0,
+        "direct prompt must not contain a parseable operations example, got " + JSON.stringify(parsed),
+      );
+    }
+  });
+
+  it("parses a trailing answer when a fenced non-ops object comes first (#235)", () => {
+    assert.deepStrictEqual(parseReviewOperations(
+      '```json\n{"note":"no ops here"}\n```\nFinal:\n{"operations":[{"action":"add","target":"user","content":"real answer"}]}',
+    ), [{ action: "add", target: "user", content: "real answer" }]);
+  });
+
+  it("recovers the answer when an unbalanced brace in prose precedes it", () => {
+    assert.deepStrictEqual(parseReviewOperations(
+      'a { broken \n{"operations":[{"action":"add","target":"user","content":"ok"}]}',
+    ), [{ action: "add", target: "user", content: "ok" }]);
+  });
+});
+
+describe("direct thinking-channel recovery (#235/#239)", () => {
+  let tmpDir: string;
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "thinking-direct-"));
+  });
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  function freshStore() {
+    return new MemoryStore({
+      memoryDir: tmpDir,
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      autoConsolidate: true,
+    });
+  }
+
+  function thinkingOnly(thinkingText: string) {
+    return { stopReason: "stop", content: [{ type: "thinking", thinking: thinkingText }] };
+  }
+
+  async function run(store: unknown, complete: unknown, extraDeps: Record<string, unknown> = {}) {
+    return runDirectMemoryCompletion(
+      { model: mockModel(false), modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "k" }), getAll: () => [mockModel(false)], getAvailable: () => [mockModel(false)] } } as never,
+      store as never,
+      null,
+      { userPrompt: "u", systemPrompt: "s", config: {} } as never,
+      null,
+      null,
+      { completeSimple: complete, ...extraDeps } as never,
+    );
+  }
+
+  it("parses ops from thinking blocks and applies them when the channel is trailing", async () => {
+    const store = freshStore();
+    const result = await run(store, () => thinkingOnly(
+      'reasoning...\n{"operations":[{"action":"add","target":"memory","content":"thinking-sourced save"}]}',
+    ));
+
+    assert.deepStrictEqual(result, { ok: true, appliedCount: 1 });
+    assert.ok(store.getMemoryEntries().some((entry: string) => entry.includes("thinking-sourced save")));
+  });
+
+  it("prefers text blocks over thinking blocks when both are present", async () => {
+    const result = await run(freshStore(), () => ({
+      stopReason: "stop",
+      content: [
+        { type: "text", text: "not json at all" },
+        { type: "thinking", thinking: '{"operations":[{"action":"add","target":"memory","content":"x"}]}' },
+      ],
+    }));
+
+    assert.deepStrictEqual(result, { ok: false, appliedCount: 0, fallbackReason: "parse_error" });
+  });
+
+  it("returns empty_response on a clean stop with neither text nor thinking", async () => {
+    assert.deepStrictEqual(
+      await run(freshStore(), () => ({ stopReason: "stop", content: [] })),
+      { ok: true, appliedCount: 0, fallbackReason: "empty_response" },
+    );
+  });
+
+  it("keeps parse_error when a truncated (length) response has no content", async () => {
+    assert.deepStrictEqual(
+      await run(freshStore(), () => ({ stopReason: "length", content: [] })),
+      { ok: false, appliedCount: 0, fallbackReason: "parse_error" },
+    );
+  });
+
+  it("treats a redacted-only completion as empty_response, not parse_error", async () => {
+    assert.deepStrictEqual(
+      await run(freshStore(), () => ({
+        stopReason: "stop",
+        content: [{ type: "thinking", thinking: "hidden", redacted: true }],
+      })),
+      { ok: true, appliedCount: 0, fallbackReason: "empty_response" },
+    );
+  });
+
+  it("falls back to thinking when the text block is whitespace only", async () => {
+    assert.deepStrictEqual(
+      await run(freshStore(), () => ({
+        stopReason: "stop",
+        content: [
+          { type: "text", text: "   \n  " },
+          { type: "thinking", thinking: '{"operations":[]}' },
+        ],
+      })),
+      { ok: true, appliedCount: 0, fallbackReason: "empty" },
+    );
+  });
+
+  it("settles empty_response when thinking output parses to nothing on a clean stop (#235)", async () => {
+    assert.deepStrictEqual(
+      await run(freshStore(), () => thinkingOnly("I thought about it but decided nothing")),
+      { ok: true, appliedCount: 0, fallbackReason: "empty_response" },
+    );
+  });
+
+  it("keeps parse_error when unparseable thinking output is truncated (#235)", async () => {
+    assert.deepStrictEqual(
+      await run(freshStore(), () => ({ stopReason: "length", content: [{ type: "thinking", thinking: '{"operations":[{"action":' }] })),
+      { ok: false, appliedCount: 0, fallbackReason: "parse_error" },
+    );
+  });
+});
+
+describe("thinking trust boundary + fallback walk (#235/#239)", () => {
+  let tmpDir: string;
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "thinking-trust-"));
+  });
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  function freshStore() {
+    return new MemoryStore({
+      memoryDir: tmpDir,
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      autoConsolidate: true,
+    });
+  }
+
+  function thinkingOnly(thinkingText: string) {
+    return { stopReason: "stop", content: [{ type: "thinking", thinking: thinkingText }] };
+  }
+
+  async function run(store: unknown, complete: unknown, extraDeps: Record<string, unknown> = {}, model: Model<Api> = mockModel(false)) {
+    return runDirectMemoryCompletion(
+      { model, modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "k" }), getAll: () => [model], getAvailable: () => [model] } } as never,
+      store as never,
+      null,
+      { userPrompt: "u", systemPrompt: "s", config: {} } as never,
+      null,
+      null,
+      { completeSimple: complete, ...extraDeps } as never,
+    );
+  }
+
+  it("applies the trailing answer when CoT restates the schema first", async () => {
+    const store = freshStore();
+    const result = await run(store, () => thinkingOnly(
+      'the schema is {"operations":[]}; final: {"operations":[{"action":"add","target":"memory","content":"real save"}]}',
+    ));
+
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.appliedCount, 1);
+  });
+
+  it("picks the trailing answer over an earlier fenced draft, and the draft's remove is not applied", async () => {
+    const store = freshStore();
+    await store.add("memory", "existing entry");
+    const result = await run(store, () => thinkingOnly(
+      '```json\n{"operations":[{"action":"remove","target":"memory","old_text":"existing entry"}]}\n```\n{"operations":[{"action":"add","target":"memory","content":"final save"}]}',
+    ));
+
+    assert.strictEqual(result.appliedCount, 1);
+    assert.ok(store.getMemoryEntries().some((entry: string) => entry.includes("existing entry")), "draft's remove must not run");
+    assert.ok(store.getMemoryEntries().some((entry: string) => entry.includes("final save")));
+  });
+
+  it("applies only adds from a non-trailing (draft-grade) candidate", async () => {
+    const store = freshStore();
+    await store.add("memory", "existing entry");
+    const result = await run(store, () => thinkingOnly(
+      '{"operations":[{"action":"remove","target":"memory","old_text":"existing entry"}]} and then some trailing prose',
+    ));
+
+    assert.strictEqual(result.appliedCount, 0);
+    assert.ok(store.getMemoryEntries().some((entry: string) => entry.includes("existing entry")), "draft remove must not run");
+  });
+
+  it("settles empty when the trailing candidate is empty, without reaching back to an earlier draft", async () => {
+    const store = freshStore();
+    const result = await run(store, () => thinkingOnly(
+      '{"operations":[{"action":"add","target":"memory","content":"draft op"}]}\n{"operations":[]}',
+    ));
+
+    assert.deepStrictEqual(result, { ok: true, appliedCount: 0, fallbackReason: "empty" });
+    assert.strictEqual(store.getMemoryEntries().length, 0);
+  });
+
+  it("walks to a healthy fallback model after a silent primary and applies its operations", async () => {
+    const store = freshStore();
+    const attempted: string[] = [];
+    const m1 = { id: "m1", provider: "p1", api: "openai-completions", reasoning: false } as Model<Api>;
+    const m2 = { id: "m2", provider: "p2", api: "openai-completions", reasoning: false } as Model<Api>;
+    const registry = {
+      getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "k" }),
+      getAll: () => [m1, m2],
+      getAvailable: () => [m1, m2],
+    };
+
+    const result = await runDirectMemoryCompletion(
+      { model: undefined, modelRegistry: registry } as never,
+      store as never,
+      null,
+      { userPrompt: "u", systemPrompt: "s", config: { llmModelOverride: "p1/m1", llmFallbackModels: ["p2/m2"] } } as never,
+      null,
+      null,
+      {
+        completeSimple: (async (model: Model<Api>) => {
+          attempted.push(model.id);
+          if (model.id === "m1") return { stopReason: "stop", content: [] };
+          return { stopReason: "stop", content: [{ type: "text", text: '{"operations":[{"action":"add","target":"memory","content":"fallback save"}]}' }] };
+        }) as never,
+      } as never,
+    );
+
+    assert.deepStrictEqual(attempted, ["m1", "m2"]);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.appliedCount, 1);
+    assert.ok(store.getMemoryEntries().some((entry: string) => entry.includes("fallback save")));
+  });
+
+  it("warns once per process when the answer parks in the thinking channel (#239)", async () => {
+    const notices: string[] = [];
+    const state = { logged: false };
+
+    await run(freshStore(), () => thinkingOnly(
+      'thinking about it\n{"operations":[{"action":"add","target":"memory","content":"notify save"}]}',
+    ), { onProviderNotice: (message: string) => notices.push(message), providerNoticeState: state });
+    assert.strictEqual(notices.length, 1);
+    assert.match(notices[0]!, /Provider misconfiguration/);
+    assert.match(notices[0]!, /test\/test-model/);
+
+    await run(freshStore(), () => thinkingOnly(
+      'thinking about it\n{"operations":[{"action":"add","target":"memory","content":"notify save 2"}]}',
+    ), { onProviderNotice: (message: string) => notices.push(message), providerNoticeState: state });
+    assert.strictEqual(notices.length, 1);
+
+    await run(freshStore(), () => ({
+      stopReason: "stop",
+      content: [{ type: "text", text: '{"operations":[{"action":"add","target":"memory","content":"t"}]}' }],
+    }), { onProviderNotice: (message: string) => notices.push(message), providerNoticeState: { logged: false } });
+    assert.strictEqual(notices.length, 1);
   });
 });
