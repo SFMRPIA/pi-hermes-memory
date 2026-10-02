@@ -291,6 +291,8 @@ export default function (pi: ExtensionAPI) {
       config.consolidationTimeoutMs,
       toolTarget,
       config,
+      undefined,
+      dbManager,
     );
     const previous = autoConsolidationTail;
     let release!: () => void;

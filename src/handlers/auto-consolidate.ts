@@ -539,11 +539,14 @@ async function resyncSqliteAfterConsolidation(
 ): Promise<void> {
   if (!dbManager) return;
   try {
-    await syncMarkdownMemoriesToSqlite(
+    const syncResult = await syncMarkdownMemoriesToSqlite(
       dbManager,
       path.join(AGENT_ROOT, "pi-hermes-memory"),
       "projects-memory",
       AGENT_ROOT,
+    );
+    appendConsolidationLog(
+      `[hermes-memory] sqlite mirror synced imported=${syncResult.imported} removed=${syncResult.removed} skipped=${syncResult.skipped} warnings=${syncResult.warnings.length}`,
     );
   } catch (syncErr) {
     appendConsolidationLog(
