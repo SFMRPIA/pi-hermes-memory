@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — fork fix: stale-view resurrection
+
+### Fixed
+
+- **Multi-process stale-view resurrection in the memory store** (fork-discovered): `dedupeTarget` and `squeezeToCap` were the only mutators that skipped the pre-save `syncTargetFromDiskIfChanged` reload and ran bare `saveToDisk` outside the markdown-mutation lock — their conflict-skip paths (the logged `cap squeeze skipped: Error` / `pre-chunk dedup skipped: Error`) left pruned state diverged from disk, and concurrent pi windows/consolidation children resurrected pruned entries on their next whole-file save. Both now route through `runTargetMutation` (lock + sync-first reload + bounded retry), mirroring `removeUnlocked`; consolidations finally shrink the store durably. Vault archive stays pre-save — a conflict retry may append a duplicate "Squeezed from" line to the append-log vault (rare, tolerated).
+
 ## [Unreleased] — fork port of upstream v0.9.7–v0.9.9 Tier 2 (fallback + thinking recovery)
 
 ### Added

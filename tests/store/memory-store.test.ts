@@ -1789,3 +1789,109 @@ describe("MemoryStore", { concurrency: 1 }, () => {
 
   });
 });
+
+describe("bulk mutator external-mutation survival (#store-resurrection)", () => {
+  let dir = "";
+  let file = "";
+
+  function meta(created: string, last = created): string {
+    return ` <!-- created=${created}, last=${last} -->`;
+  }
+
+  before(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-resurrect-"));
+    file = path.join(dir, MEMORY_FILE);
+  });
+
+  after(async () => {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch { /* ignore */ }
+  });
+
+  it("dedupeTarget() survives an external append between load and save", async () => {
+    const e1 = "Fahmi never stores ssh keys or hostnames in memory; access is fresh per session." + meta("2026-08-17");
+    const e2 = "Fahmi never stores ssh keys or hostnames in memory — access is fresh per session." + meta("2026-08-17");
+    const e3 = "Qwen family runs clean on intel arc a770; gemma freezes the pc." + meta("2026-08-17");
+    await writeRaw(file, [e1, e2, e3].join(ENTRY_DELIMITER));
+    const store = new MemoryStore(makeConfig({ memoryDir: dir }));
+    await store.loadFromDisk();
+
+    // Another process appends a distinct entry AFTER the store loaded.
+    const external = "External writer appended this unique line during the race." + meta("2026-08-18");
+    await fs.appendFile(file, ENTRY_DELIMITER + external);
+
+    const removed = await store.dedupeTarget("memory");
+    assert.strictEqual(removed, 1);
+
+    // The external entry must survive the dedupe's whole-file save.
+    const onDisk = await readRaw(file);
+    assert.ok(onDisk.includes("External writer appended this unique line during the race."), "external entry must survive");
+    assert.strictEqual(store.getMemoryEntries().length, 3);
+  });
+
+  it("squeezeToCap() survives an external append and keeps the newest entries", async () => {
+    const fat = (i: number, d: string): string => `Fat entry number ${i}: ${"x".repeat(580)}` + meta(d);
+    await writeRaw(file, [fat(1, "2026-08-01"), fat(2, "2026-08-02"), fat(3, "2026-08-03")].join(ENTRY_DELIMITER));
+    const store = new MemoryStore(makeConfig({ memoryDir: dir, memoryCharLimit: 2000 }));
+    await store.loadFromDisk();
+
+    const external = "External writer appended this unique line during the race." + meta("2026-08-04");
+    await fs.appendFile(file, ENTRY_DELIMITER + external);
+
+    const squeezed = await store.squeezeToCap("memory");
+    assert.strictEqual(squeezed, 1, "only the oldest entry must be evicted to reach the cap");
+
+    const onDisk = await readRaw(file);
+    assert.ok(onDisk.includes("External writer appended this unique line during the race."), "external entry must survive the squeeze");
+    assert.ok(onDisk.includes("Fat entry number 3:"), "newest fat entry survives");
+    assert.ok(!onDisk.includes("Fat entry number 1:"), "oldest fat entry evicted");
+    assert.ok(onDisk.includes("Fat entry number 2:"), "middle fat entry survives");
+  });
+
+  it("conflict path retries once and the retried dedupe runs against disk truth", async () => {
+    const e1 = "Alpha unique entry for the conflict test." + meta("2026-08-17");
+    const e2 = "Alpha unique entry for the conflict test — reworded so the near-dup check catches it." + meta("2026-08-17");
+    const e3 = "Beta distinct entry for the conflict test." + meta("2026-08-17");
+    await writeRaw(file, [e1, e2, e3].join(ENTRY_DELIMITER));
+    const store = new MemoryStore(makeConfig({ memoryDir: dir }));
+    await store.loadFromDisk();
+
+    // Deterministic conflict: the FIRST publish is preceded by an external
+    // write, so the fingerprint guard throws ExternalMemoryWriteConflict and
+    // runTargetMutation reloads + re-invokes the closure once.
+    const realSave = (store as unknown as { saveToDisk: (t: "memory") => Promise<void> }).saveToDisk.bind(store);
+    let saveCalls = 0;
+    (store as unknown as { saveToDisk: (t: "memory") => Promise<void> }).saveToDisk = async function (target: "memory") {
+      saveCalls++;
+      if (saveCalls === 1) {
+        const external = "External writer landed during the conflict window." + meta("2026-08-19");
+        await fs.appendFile(file, ENTRY_DELIMITER + external);
+      }
+      return realSave(target);
+    };
+
+    const removed = await store.dedupeTarget("memory");
+    assert.strictEqual(saveCalls, 2, "saveToDisk must be retried once after the conflict");
+    assert.strictEqual(removed, 1, "retried dedupe counts against fresh disk truth");
+
+    const onDisk = await readRaw(file);
+    assert.ok(onDisk.includes("External writer landed during the conflict window."), "external entry survives the retry");
+    assert.ok(onDisk.includes("Alpha unique entry for the conflict test."), "dup-collapse kept one alpha");
+    assert.ok(onDisk.includes("Beta distinct entry for the conflict test."), "beta kept");
+    assert.ok(!onDisk.includes(ENTRY_DELIMITER + ENTRY_DELIMITER), "no empty entries");
+  });
+
+  it("dedupe/squeeze on a tidy store are no-ops that do not rewrite the file", async () => {
+    const a = "Fahmi never stores ssh keys or hostnames in memory; access is fresh per session." + meta("2026-08-17");
+    const b = "The Intel Arc A770 freezes the whole pc with gemma models." + meta("2026-08-17");
+    await writeRaw(file, [a, b].join(ENTRY_DELIMITER));
+    const store = new MemoryStore(makeConfig({ memoryDir: dir }));
+    await store.loadFromDisk();
+    const before = await readRaw(file);
+
+    assert.strictEqual(await store.dedupeTarget("memory"), 0);
+    assert.strictEqual(await store.squeezeToCap("memory"), 0);
+    assert.strictEqual(await readRaw(file), before, "tidy store must not be rewritten");
+  });
+});
