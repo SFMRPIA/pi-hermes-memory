@@ -14,7 +14,7 @@ import { DatabaseManager } from "../store/db.js";
 import type { MemoryConfig } from "../types.js";
 import { applyRecentMessageLimit, collectMessageParts } from "./message-parts.js";
 import { execChildPrompt } from "./pi-child-process.js";
-import { runDirectMemoryCompletion, readSessionId, usesDirectTransport, type DirectReviewResult } from "./review-memory-ops.js";
+import { REVIEW_COMPLETION_TIMEOUT_MS, runDirectMemoryCompletion, readSessionId, usesDirectTransport, type DirectReviewResult } from "./review-memory-ops.js";
 
 export interface BackgroundReviewOptions {
   dbManager?: DatabaseManager | null;
@@ -109,7 +109,7 @@ async function runSubprocessReview(
 ): Promise<{ code: number; stdout?: string }> {
   return execChild(pi, prompt, config, {
     signal: undefined,
-    timeoutMs: 120000,
+    timeoutMs: REVIEW_COMPLETION_TIMEOUT_MS,
   });
 }
 
@@ -211,7 +211,7 @@ export function setupBackgroundReview(
             ctx as Pick<ExtensionContext, "model" | "modelRegistry">,
             store,
             projectStore,
-            { userPrompt: directPrompt, systemPrompt: DIRECT_REVIEW_SYSTEM_PROMPT, config, timeoutMs: 120000, sessionId: readSessionId(ctx.sessionManager) },
+            { userPrompt: directPrompt, systemPrompt: DIRECT_REVIEW_SYSTEM_PROMPT, config, timeoutMs: REVIEW_COMPLETION_TIMEOUT_MS, sessionId: readSessionId(ctx.sessionManager) },
             dbManager,
             projectName,
           );

@@ -56,6 +56,8 @@ export interface MemoryConfig {
   quickCheckOnOpen?: boolean;
   /** Override model used for child pi -p subprocess LLM calls. Default: unset */
   llmModelOverride?: string;
+  /** Fallback model chain tried in order when the primary review model fails (rate limit, 401/403, 404, 500/503, invalid response). Default: unset */
+  llmFallbackModels?: string[];
   /** Override thinking level used for child pi -p subprocess LLM calls. Default: unset */
   llmThinkingOverride?: ThinkingLevel;
   /** Extra extension entry paths required by child Pi processes, such as provider auth adapters. */

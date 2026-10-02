@@ -220,10 +220,10 @@ export async function triggerConsolidation(
   // Direct transport runs under the same lock; it is only successful if it
   // both runs AND frees space, otherwise we fall through to the subprocess
   // below (still under this lock, so never concurrent with another run).
-  const directOk = await (async () => {
-    if (!(directCtx && usesDirectTransport(llmConfig))) return false;
+  const directAttempt = await (async () => {
+    if (!(directCtx && usesDirectTransport(llmConfig))) return null;
     try {
-      const directResult = await runDirect(
+      return await runDirect(
         directCtx,
         store,
         toolTarget === "project" ? store : null,
@@ -242,17 +242,34 @@ export async function triggerConsolidation(
         dbManager,
         projectName,
       );
-      return directResult.ok && directResult.appliedCount > 0;
     } catch {
-      return false;
+      return null;
     }
   })();
+  const directOk = directAttempt !== null && directAttempt.ok && directAttempt.appliedCount > 0;
   if (directOk) {
     await resyncSqliteAfterConsolidation(dbManager);
     await lock.release().catch(() => {});
     return { consolidated: true };
   }
 
+  // An empty completion is terminal (#235): the direct model answered with
+  // nothing in either channel, so the subprocess child would run the same
+  // model against the same server-side thinking default and fail the same
+  // way (#197). The success criterion is unchanged — it must actually shrink
+  // — but this case reports instead of spawning the child. (Inert in the
+  // fork today: directCtx is always null here, so consolidation stays
+  // subprocess-only — kept for upstream parity.)
+  if (directAttempt?.ok && directAttempt.fallbackReason === "empty_response") {
+    const modelRef = directCtx?.model?.provider
+      ? `${directCtx.model.provider}/${directCtx.model.id}`
+      : "model";
+    await lock.release().catch(() => {});
+    return {
+      consolidated: false,
+      error: `${modelRef} returned an empty completion; no consolidation attempted`,
+    };
+  }
   try {
 
     // Chunked consolidation: one giant prompt over a huge store times out
