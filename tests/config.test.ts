@@ -437,3 +437,50 @@ describe("loadConfig", () => {
     assert.strictEqual(config.correctionDirectiveWords, undefined);
   });
 });
+
+describe("llmFallbackModels parsing (#215/#219)", () => {
+  afterEach(() => {
+    fs.rmSync(TEST_CONFIG_PATH, { force: true });
+  });
+
+  it("merges array-form override tails with explicit llmFallbackModels", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      llmModelOverride: ["p1/m1", "p2/m2"],
+      llmFallbackModels: ["p3/m3"],
+    }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.llmModelOverride, "p1/m1");
+    assert.deepStrictEqual(config.llmFallbackModels, ["p2/m2", "p3/m3"]);
+  });
+
+  it("trims, drops empties, and dedupes llmFallbackModels", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      llmModelOverride: "p1/m1",
+      llmFallbackModels: ["p2/m2", " p2/m2 ", "", "p3/m3"],
+    }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.deepStrictEqual(config.llmFallbackModels, ["p2/m2", "p3/m3"]);
+  });
+
+  it("accepts legacy llmModelFallbacks / fallbackModels aliases additively", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      llmModelOverride: "p1/m1",
+      llmFallbackModels: ["p2/m2"],
+      llmModelFallbacks: ["p3/m3"],
+      fallbackModels: ["p3/m3", "p4/m4"],
+    }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.deepStrictEqual(config.llmFallbackModels, ["p2/m2", "p3/m3", "p4/m4"]);
+  });
+
+  it("leaves the chain unset when no fallback fields are present", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ llmModelOverride: "p1/m1" }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.llmModelOverride, "p1/m1");
+    assert.strictEqual(config.llmFallbackModels, undefined);
+  });
+});

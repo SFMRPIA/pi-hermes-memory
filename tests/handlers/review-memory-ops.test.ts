@@ -10,6 +10,7 @@ import {
   buildDirectReviewCompletionOptions,
   isAuthRejection,
   parseReviewOperations,
+  resolveReviewModels,
   runDirectMemoryCompletion,
 } from "../../src/handlers/review-memory-ops.js";
 import { DatabaseManager } from "../../src/store/db.js";
@@ -376,5 +377,131 @@ describe("opencode session header (#250)", () => {
       "sess-1",
     );
     assert.strictEqual(options.headers, headers);
+  });
+});
+
+describe("fallback model chain (#215/#219)", () => {
+  function twoModelRegistry() {
+    const m1 = { id: "m1", provider: "p1", api: "openai-completions", reasoning: false } as Model<Api>;
+    const m2 = { id: "m2", provider: "p2", api: "openai-completions", reasoning: false } as Model<Api>;
+    let authCalls = 0;
+    const registry = {
+      getApiKeyAndHeaders: async () => {
+        authCalls++;
+        return { ok: true as const, apiKey: "k" };
+      },
+      getAll: () => [m1, m2],
+      getAvailable: () => [m1, m2],
+    };
+    return { registry, get authCalls() { return authCalls; } };
+  }
+
+  function chainOptions(signal?: AbortSignal) {
+    return {
+      userPrompt: "u",
+      systemPrompt: "s",
+      config: { llmModelOverride: "p1/m1", llmFallbackModels: ["p2/m2"] },
+      ...(signal ? { signal } : {}),
+    };
+  }
+
+  const chainEmptyReview = {
+    stopReason: "stop",
+    content: [{ type: "text", text: JSON.stringify({ operations: [] }) }],
+  };
+
+  it("stops the chain when the caller aborts instead of trying the next model", async () => {
+    const caller = new AbortController();
+    const attempted: string[] = [];
+    const complete = async (model: Model<Api>) => {
+      attempted.push(model.id);
+      caller.abort();
+      return { stopReason: "aborted" };
+    };
+    const chain = twoModelRegistry();
+
+    const result = await runDirectMemoryCompletion(
+      { model: undefined, modelRegistry: chain.registry } as never,
+      null as never,
+      null,
+      chainOptions(caller.signal),
+      null,
+      null,
+      { completeSimple: complete as never },
+    );
+
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.fallbackReason, "aborted");
+    assert.deepStrictEqual(attempted, ["m1"]);
+    assert.strictEqual(chain.authCalls, 1);
+  });
+
+  it("still tries the next model after a per-model timeout while the caller is alive", async () => {
+    const caller = new AbortController();
+    const attempted: string[] = [];
+    const complete = async (model: Model<Api>) => {
+      attempted.push(model.id);
+      if (attempted.length === 1) return { stopReason: "aborted" };
+      return chainEmptyReview;
+    };
+
+    const chain = twoModelRegistry();
+    const result = await runDirectMemoryCompletion(
+      { model: undefined, modelRegistry: chain.registry } as never,
+      null as never,
+      null,
+      chainOptions(caller.signal),
+      null,
+      null,
+      { completeSimple: complete as never },
+    );
+
+    assert.deepStrictEqual(attempted, ["m1", "m2"]);
+    assert.strictEqual(result.ok, true);
+  });
+
+  it("advances the chain on parse errors and reports provider_error after exhausting it", async () => {
+    const attempted: string[] = [];
+    const complete = async (model: Model<Api>) => {
+      attempted.push(model.id);
+      if (attempted.length === 1) return { stopReason: "stop", content: [{ type: "text", text: "not json" }] };
+      throw new Error("p2 down");
+    };
+
+    const chain = twoModelRegistry();
+    const result = await runDirectMemoryCompletion(
+      { model: undefined, modelRegistry: chain.registry } as never,
+      null as never,
+      null,
+      chainOptions(),
+      null,
+      null,
+      { completeSimple: complete as never },
+    );
+
+    assert.deepStrictEqual(attempted, ["m1", "m2"]);
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.fallbackReason, "provider_error");
+    assert.strictEqual(result.error, "p2 down");
+  });
+
+  it("resolves the chain in order and falls back to the ctx model when nothing resolves", () => {
+    const m1 = { id: "m1", provider: "p1", api: "openai-completions", reasoning: false } as Model<Api>;
+    const m2 = { id: "m2", provider: "p2", api: "openai-completions", reasoning: false } as Model<Api>;
+    const ctxModel = { id: "ctx", provider: "pc", api: "openai-completions", reasoning: false } as Model<Api>;
+    const registry = { getAll: () => [m1, m2], getAvailable: () => [m1, m2] };
+
+    assert.deepStrictEqual(
+      resolveReviewModels(undefined, registry as never, { llmModelOverride: "p1/m1", llmFallbackModels: ["p2/m2"] } as never),
+      [m1, m2],
+    );
+    assert.deepStrictEqual(
+      resolveReviewModels(ctxModel, { getAll: () => [] } as never, { llmModelOverride: "ghost/x" } as never),
+      [ctxModel],
+    );
+    assert.deepStrictEqual(
+      resolveReviewModels(ctxModel, { getAll: () => [] } as never, {} as never),
+      [ctxModel],
+    );
   });
 });
