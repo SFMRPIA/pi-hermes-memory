@@ -153,6 +153,24 @@ export class MemoryStore {
     return entries.length ? entries.join(ENTRY_DELIMITER).length : 0;
   }
 
+  /**
+   * Public read for consolidation tooling: the char budget this target is held
+   * to (failure tier is 2× the memory limit). Chunked consolidation stops at
+   * this goal instead of its own prompt budget, so a 2×-tier store is not
+   * over-merged down to a single slice size.
+   */
+  capacityGoal(target: "memory" | "user" | "failure"): number {
+    return this.charLimit(target);
+  }
+
+  /**
+   * Public read for consolidation tooling: the store's current size in the
+   * SAME units the cap enforces (encoded entries, metadata included).
+   */
+  capacityUsage(target: "memory" | "user" | "failure"): number {
+    return this.charCount(target);
+  }
+
   private memoryOverflowStrategy(): MemoryOverflowStrategy {
     return this.config.memoryOverflowStrategy ?? (this.config.autoConsolidate ? "auto-consolidate" : "reject");
   }

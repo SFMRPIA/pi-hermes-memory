@@ -298,7 +298,7 @@ export default function (pi: ExtensionAPI) {
       // Failures go to the consolidation log file, not the terminal (the user
       // asked for a clean console; the retry/self-healing path already handles
       // recovery, and the log keeps the details greppable).
-      appendConsolidationLog(`[hermes-memory] auto-consolidation failed for '${toolTarget}': ${result.error ?? "no reason reported"}`);
+      appendConsolidationLog(`[hermes-memory] auto-consolidation ${result.partial ? "partially " : ""}failed for '${toolTarget}': ${result.error ?? "no reason reported"}`);
     }
     return result;
   };

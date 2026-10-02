@@ -27,9 +27,12 @@ import { MemoryStore } from "../store/memory-store.js";
 import { DatabaseManager } from "../store/db.js";
 import {
   CONSOLIDATION_PROMPT,
+  CONSOLIDATION_CHUNK_CHARS_MIN,
+  DEFAULT_CONSOLIDATION_CHUNK_CHARS,
   DEFAULT_CONSOLIDATION_TIMEOUT_MS,
   DIRECT_CONSOLIDATION_SYSTEM_PROMPT,
   ENTRY_DELIMITER,
+  MAX_CONSOLIDATION_ROUNDS,
 } from "../constants.js";
 import type { ConsolidationResult, MemoryConfig } from "../types.js";
 import { AGENT_ROOT } from "../paths.js";
@@ -41,7 +44,7 @@ import { syncMarkdownMemoriesToSqlite } from "./sync-markdown-memories.js";
 
 type MemoryTarget = "memory" | "user" | "failure";
 type ToolMemoryTarget = MemoryTarget | "project";
-type ConsolidationLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride" | "reviewTransport">;
+type ConsolidationLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride" | "reviewTransport" | "consolidationChunking" | "consolidationChunkChars">;
 
 const CONSOLIDATION_LOCK_STALE_GRACE_MS = 30000;
 const CONSOLIDATION_LOCK_ENV = "PI_HERMES_CONSOLIDATION_LOCK_DIR";
@@ -115,24 +118,57 @@ function describeConsolidationFailure(
   return `Consolidation process exited with code ${result.code}: ${stderr?.slice(0, 200) || "unknown error"}`;
 }
 
-/**
- * Roll back a failed consolidation: re-add any pre-run entries the child
- * removed before it died/failed, so a killed consolidation never leaves the
- * store half-empty. Idempotent — store.add skips entries that still exist.
- */
-async function restorePreRunEntries(
-  store: MemoryStore,
+/** A round shorter than this cannot plausibly boot a child and merge anything. */
+const MIN_ROUND_MS = 10_000;
+
+function buildConsolidationPrompt(
   target: MemoryTarget,
+  toolTarget: ToolMemoryTarget,
   entries: string[],
-): Promise<void> {
-  for (const entry of entries) {
-    if (!entry.trim()) continue;
-    try {
-      await store.add(target, entry);
-    } catch {
-      // Best-effort rollback; the recovery snapshots remain the final backstop.
-    }
+  scoped = false,
+): string {
+  const lines = [
+    CONSOLIDATION_PROMPT,
+    "",
+    `--- Current ${labelForTarget(target, toolTarget)} Entries ---`,
+    entries.join(ENTRY_DELIMITER) || "(empty)",
+    "",
+    `Use the memory tool to consolidate. Target: '${toolTarget}'`,
+  ];
+  if (scoped) {
+    // Chunked rounds present a slice of the store, but the child's memory tools
+    // can see everything. Without an explicit scope the model may modify entries
+    // it was never shown — observed in real upstream runs (a round wiped 11
+    // out-of-scope entries).
+    lines.push(
+      "This pass covers ONLY the entries listed above — they are one slice of a larger store being consolidated in rounds.",
+      "Do NOT add, modify, or remove any entry that is not listed above.",
+    );
   }
+  return lines.join("\n");
+}
+
+function chunkCharsFor(config: ConsolidationLlmConfig): number {
+  const value = config.consolidationChunkChars;
+  return typeof value === "number" && Number.isFinite(value) && value >= CONSOLIDATION_CHUNK_CHARS_MIN
+    ? value
+    : DEFAULT_CONSOLIDATION_CHUNK_CHARS;
+}
+
+/**
+ * Head entries worth up to chunkChars of prompt text. Whole entries only; an
+ * entry larger than chunkChars travels alone so the loop always makes progress.
+ */
+export function takeChunk(entries: string[], chunkChars: number): string[] {
+  const batch: string[] = [];
+  let length = 0;
+  for (const entry of entries) {
+    const entryLength = entry.length + ENTRY_DELIMITER.length;
+    if (batch.length > 0 && length + entryLength > chunkChars) break;
+    batch.push(entry);
+    length += entryLength;
+  }
+  return batch;
 }
 
 /**
@@ -184,7 +220,7 @@ export async function triggerConsolidation(
   if (currentContent.length > 0 && currentContent.length < limitForSkip * 0.8) {
     appendConsolidationLog(`[hermes-memory] consolidate skip — under 80% cap (${currentContent.length}/${limitForSkip}) for ${toolTarget}, dedupe+squeeze already tidy`);
     await resyncSqliteAfterConsolidation(dbManager);
-    return { consolidated: true };
+    return { consolidated: true, rounds: 0 };
   }
 
   appendConsolidationLog(
@@ -270,76 +306,217 @@ export async function triggerConsolidation(
       error: `${modelRef} returned an empty completion; no consolidation attempted`,
     };
   }
+  const chunkChars = chunkCharsFor(llmConfig);
+  const chunkingEnabled = llmConfig.consolidationChunking === true;
+  const hasUsage = typeof (store as unknown as { capacityUsage?: (t: string) => number }).capacityUsage === "function";
+  const usageOf = (list: string[]): number =>
+    hasUsage
+      ? (store as unknown as { capacityUsage: (t: string) => number }).capacityUsage(target)
+      : list.join(ENTRY_DELIMITER).length;
+  const goal = typeof (store as unknown as { capacityGoal?: (t: string) => number }).capacityGoal === "function"
+    ? (store as unknown as { capacityGoal: (t: string) => number }).capacityGoal(target)
+    : chunkChars;
+
   try {
-
-    // Chunked consolidation: one giant prompt over a huge store times out
-    // (the LLM cannot summarize 100k+ chars in one pass). Split the entries
-    // into small chunks so every child finishes quickly; the children run
-    // sequentially under the same lock and each removes only its own slice.
-    // ponytail: topic-sort before chunking — lexicographic sort of normalized entries clusters BiPOS/Session together (80% of lane benefit, 0 storm)
-    {
-      const normForSort = (s: string) => s.replace(/<!--[\s\S]*?-->/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
-      entries.sort((a, b) => normForSort(a).localeCompare(normForSort(b)));
-      currentContent = entries.join(ENTRY_DELIMITER);
-    }
-    const CHUNK_CHARS = 8000;
-    const chunks: string[][] = [];
-    let chunk: string[] = [];
-    let chunkChars = 0;
-    for (const entry of entries) {
-      if (chunk.length > 0 && chunkChars + entry.length > CHUNK_CHARS) {
-        chunks.push(chunk);
-        chunk = [];
-        chunkChars = 0;
-      }
-      chunk.push(entry);
-      chunkChars += entry.length + ENTRY_DELIMITER.length;
-    }
-    if (chunk.length > 0) chunks.push(chunk);
-    // Preserve legacy behavior: even an empty store runs one (no-op) child.
-    if (chunks.length === 0) chunks.push([]);
-
-    let ok = false;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkContent = chunks[i].join(ENTRY_DELIMITER);
-      const chunkPrompt = [
-        CONSOLIDATION_PROMPT,
-        "",
-        `--- Current ${labelForTarget(target, toolTarget)} Entries (chunk ${i + 1}/${chunks.length}) ---`,
-        chunkContent || "(empty)",
-        "",
-        `Use the memory tool to consolidate. Target: '${toolTarget}'`,
-      ].join("\n");
-      const result = await execChildPrompt(pi, chunkPrompt, llmConfig, {
+    if (!chunkingEnabled) {
+      // Legacy single-shot path — the flag default. Byte-identical to
+      // pre-chunking releases for stores of any size. When an oversized
+      // store times out, the error names the remedy keys so the failure
+      // teaches the fix.
+      const result = await execChildPrompt(pi, buildConsolidationPrompt(target, toolTarget, entries), llmConfig, {
         signal,
         timeoutMs,
         retryWithoutOverrides: true,
       }) as { code: number; stdout?: string; stderr?: string; killed?: boolean };
       const elapsedMs = Date.now() - runStartedAt;
       appendConsolidationLog(
-        `[hermes-memory] consolidate child done target=${toolTarget} chunk=${i + 1}/${chunks.length} code=${result.code} killed=${result.killed ?? false} elapsed=${elapsedMs}ms ts=${new Date().toISOString()}`,
+        `[hermes-memory] consolidate child done target=${toolTarget} chunk=1/1 code=${result.code} killed=${result.killed ?? false} elapsed=${elapsedMs}ms ts=${new Date().toISOString()}`,
       );
-      if (result.code !== 0) {
-        await restorePreRunEntries(store, target, entries);
-        appendConsolidationLog(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget}`);
-        return {
-          consolidated: false,
-          error: describeConsolidationFailure(result, timeoutMs),
-        };
+      if (result.code === 0) {
+        await resyncSqliteAfterConsolidation(dbManager);
+        return { consolidated: true };
       }
-      ok = true;
+      let error = describeConsolidationFailure(result, timeoutMs);
+      const terminated = result.killed || result.code === 124 || result.code === 143;
+      if (terminated && entries.join(ENTRY_DELIMITER).length > chunkChars) {
+        error += ` This store exceeds consolidationChunkChars (${chunkChars}) — enabling consolidationChunking splits consolidation into bounded rounds.`;
+      }
+      appendConsolidationLog(`[hermes-memory] consolidate child failed target=${toolTarget} code=${result.code} killed=${result.killed ?? false}`);
+      return { consolidated: false, error };
     }
-    if (ok) {
+
+    if (entries.length === 0 || usageOf(entries) <= goal) {
+      // Within the target's capacity goal (encoded units, same as the cap):
+      // nothing needs to shrink toward the goal — a clean no-op, not a
+      // failure. Covers healthy stores of any size, the failure tier, and
+      // manual triggers on stores that do not need consolidation.
       await resyncSqliteAfterConsolidation(dbManager);
-      return { consolidated: true };
+      return { consolidated: true, rounds: 0 };
     }
-    return { consolidated: false, error: "no chunks to consolidate" };
-  } catch (err) {
-    await restorePreRunEntries(store, target, entries);
-    appendConsolidationLog(`[hermes-memory] consolidate rollback restored ${entries.length} pre-run entries for ${toolTarget} (exception)`);
+
+    const deadline = Date.now() + timeoutMs;
+
+    // Chunked path — the store exceeds one child run's prompt budget, and a
+    // single whole-store LLM merge is what produced the observed "subprocess
+    // terminated (likely timeout)" failures at cap scale. Rounds share the
+    // overall budget (deadline): each consolidates a slice, then reloads from
+    // disk (the child modified files) and re-evaluates. A store that fits one
+    // prompt runs a single UNSCOPED decisive round. Resume needs no cursor:
+    // partial progress is already on disk.
+    // ponytail: topic-sort before chunking — lexicographic sort of normalized entries clusters BiPOS/Session together (80% of lane benefit, 0 storm)
+    {
+      const normForSort = (s: string) => s.replace(/<!--[\s\S]*?-->/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+      entries.sort((a, b) => normForSort(a).localeCompare(normForSort(b)));
+      currentContent = entries.join(ENTRY_DELIMITER);
+    }
+
+    let completedRounds = 0;
+    let progressRounds = 0;
+    const notes: string[] = [];
+    let offset = 0;
+
+    while (completedRounds < MAX_CONSOLIDATION_ROUNDS) {
+      if (entries.length === 0) break; // everything merged away
+      const promptTotal = entries.join(ENTRY_DELIMITER).length;
+      if (promptTotal <= chunkChars && usageOf(entries) <= goal) break; // capacity goal met
+      if (signal?.aborted) {
+        notes.push("aborted between consolidation rounds");
+        break;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining < MIN_ROUND_MS) {
+        notes.push(`consolidation time budget (${timeoutMs}ms) exhausted; retrigger consolidation to continue from current state`);
+        break;
+      }
+
+      // Removals in earlier rounds shift indices left; the walk offset may
+      // point past the (now shorter) store — wrap it instead of slicing an
+      // empty batch.
+      if (offset >= entries.length) offset = 0;
+
+      const fitsOneChunk = promptTotal <= chunkChars;
+      const usageBefore = usageOf(entries);
+      const batch = fitsOneChunk ? entries : takeChunk(entries.slice(offset), chunkChars);
+      const batchSet = new Set(batch);
+      const beforeRound = entries;
+      const result = await execChildPrompt(
+        pi,
+        buildConsolidationPrompt(target, toolTarget, batch, !fitsOneChunk),
+        llmConfig,
+        { signal, timeoutMs: Math.min(timeoutMs, remaining), retryWithoutOverrides: true },
+      ) as { code: number; stdout?: string; stderr?: string; killed?: boolean };
+
+      // Reload FIRST — even a failed round may have shrunk the store before
+      // dying, and the recount below decides how the failure is reported.
+      try {
+        await store.loadFromDisk();
+        entries = entriesForTarget(store, target);
+      } catch {
+        notes.push("could not reload memory after a consolidation round");
+        break;
+      }
+
+      const currentRound = completedRounds + 1;
+      const elapsedMs = Date.now() - runStartedAt;
+      appendConsolidationLog(
+        `[hermes-memory] consolidate child done target=${toolTarget} chunk=${currentRound}/${MAX_CONSOLIDATION_ROUNDS} code=${result.code} killed=${result.killed ?? false} elapsed=${elapsedMs}ms ts=${new Date().toISOString()}`,
+      );
+
+      // Out-of-scope changes: entries that vanished this round without being
+      // part of the presented slice. The child can see the whole store through
+      // its tools, and a concurrent session may delete entries in this window
+      // too — the parent cannot tell a rogue deletion from a legitimate
+      // cross-slice dedup or a concurrent one, so out-of-scope disappearances
+      // are REPORTED, never resurrected (resurrection would fight legitimate
+      // dedup and ping-pong across triggers; the store's recovery snapshots
+      // remain the repair path for real damage). Reported on failed rounds too.
+      const outOfScope = beforeRound.filter(
+        (entry) => !batchSet.has(entry) && !entries.includes(entry),
+      );
+      if (outOfScope.length > 0) {
+        notes.push(`round ${currentRound} coincided with ${outOfScope.length} out-of-scope entr${outOfScope.length === 1 ? "y" : "ies"} disappearing (by the child or a concurrent writer) — inspect memory if that was not intended`);
+      }
+
+      const usageAfter = usageOf(entries);
+      const shrank = usageAfter < usageBefore;
+
+      if (result.code !== 0) {
+        if (shrank) {
+          // The round shrank the store and THEN died (killed mid-merge). The
+          // shrink is real and on disk — report it as partial progress instead
+          // of a total failure, and let the next trigger resume.
+          progressRounds++;
+          notes.push(describeConsolidationFailure(result, Math.min(timeoutMs, remaining))
+            + ` The failing round still shrank the store by ${usageBefore - usageAfter} chars; retrigger consolidation to continue.`);
+        } else {
+          notes.push(describeConsolidationFailure(result, Math.min(timeoutMs, remaining))
+            + (completedRounds > 0
+              ? ` ${completedRounds} earlier round${completedRounds === 1 ? "" : "s"} shrank the store; retrigger consolidation to continue.`
+              : ""));
+        }
+        break;
+      }
+
+      completedRounds++;
+
+      if (!shrank) {
+        // This round shrank nothing. Walk to the next slice rather than
+        // repeating it; when nothing in the walk yields, the round-cap exit
+        // below reports the store as still over its goal.
+        if (fitsOneChunk) {
+          notes.push(`consolidation could not shrink the remaining ${promptTotal} chars (capacity goal ${goal}); entries may be distinct facts worth keeping — consider manual pruning`);
+          break;
+        }
+        offset = (offset + batch.length) % Math.max(entries.length, 1);
+        continue;
+      }
+
+      progressRounds++;
+      // Progress: keep walking forward past the slice this round consumed
+      // (removals shift indices left, so this is approximate) — resetting to
+      // the top would let a store whose head always yields a little progress
+      // starve the tail forever.
+      offset = (offset + batch.length) % Math.max(entries.length, 1);
+      if (usageAfter <= goal) break; // capacity goal met
+      if (fitsOneChunk) break; // decisive round done; the next trigger starts a fresh pass
+    }
+
+    if (progressRounds > 0) {
+      const roundNotes = [...notes];
+      const usageEnd = usageOf(entries);
+      if (usageEnd > goal) {
+        roundNotes.push(`store still ${usageEnd - goal} chars over its ${goal}-char capacity goal; entries may be distinct facts worth keeping — consider manual pruning or raising the limit`);
+      }
+      appendConsolidationLog(`[hermes-memory] consolidate partial target=${toolTarget} rounds=${completedRounds}${roundNotes.length ? ` notes=${roundNotes.join(" | ").slice(0, 400)}` : ""}`);
+      await resyncSqliteAfterConsolidation(dbManager);
+      return {
+        consolidated: true,
+        partial: roundNotes.length > 0,
+        rounds: completedRounds,
+        ...(roundNotes.length ? { error: roundNotes.join("; ") } : {}),
+      };
+    }
+    notes.push(`consolidation could not shrink the store toward its ${goal}-char capacity goal (${usageOf(entries)} chars); entries may be distinct facts worth keeping — consider manual pruning or raising the limit`);
     return {
       consolidated: false,
-      error: `Consolidation failed: ${String(err).slice(0, 200)}`,
+      error: notes.join("; "),
+    };
+  } catch (err) {
+    // No rollback: a failed/exception round keeps its on-disk progress
+    // (upstream #236 — re-adds fight legitimate dedup and ping-pong across
+    // triggers); the store's .recovery snapshots are the repair backstop.
+    const message = String(err);
+    if (message.includes("extension ctx is stale")) {
+      appendConsolidationLog(`[hermes-memory] consolidate deferred (stale ctx) target=${toolTarget}`);
+      return {
+        consolidated: false,
+        deferred: true,
+        error: "session replaced or reloaded during consolidation — will consolidate on next write",
+      };
+    }
+    return {
+      consolidated: false,
+      error: `Consolidation failed: ${message.slice(0, 200)}`,
     };
   } finally {
     if (lock) {
@@ -455,7 +632,9 @@ export function registerConsolidateCommand(
 
         if (result.consolidated) {
           await item.store.loadFromDisk();
-          results.push(`${item.label}: ✅ consolidated`);
+          const roundsNote = typeof result.rounds === "number" && result.rounds > 0 ? ` (${result.rounds} round${result.rounds === 1 ? "" : "s"})` : "";
+          const partialNote = result.partial ? ` ⚠️ partial: ${result.error ?? "incomplete"}` : "";
+          results.push(`${item.label}: ✅ consolidated${roundsNote}${partialNote}`);
         } else {
           results.push(`${item.label}: ❌ ${result.error}`);
         }

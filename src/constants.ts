@@ -35,6 +35,14 @@ export const DEFAULT_FLUSH_RECENT_MESSAGES = 0;
  * including lower ones; `loadConfig` warns when a value below this is set.
  */
 export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 600000;
+/** Default prompt budget (chars) per chunked consolidation round. */
+export const DEFAULT_CONSOLIDATION_CHUNK_CHARS = 4000;
+/** Default state of chunked subprocess consolidation (off = legacy single-shot). */
+export const DEFAULT_CONSOLIDATION_CHUNKING = false;
+/** Minimum accepted consolidationChunkChars value; smaller values are ignored. */
+export const CONSOLIDATION_CHUNK_CHARS_MIN = 500;
+/** Built-in cap on chunked consolidation rounds (bounded by the shared time budget too). */
+export const MAX_CONSOLIDATION_ROUNDS = 6;
 /**
  * Minimum gap between auto-consolidation attempts per target. Without this a
  * store left over-cap by a failed/instant-killed run re-schedules on every

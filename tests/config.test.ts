@@ -31,6 +31,8 @@ describe("loadConfig", () => {
     assert.strictEqual(config.memoryOverflowStrategy, "auto-consolidate");
     assert.strictEqual(config.autoConsolidate, true);
     assert.strictEqual(config.consolidationTimeoutMs, 600000);
+    assert.strictEqual(config.consolidationChunking, false);
+    assert.strictEqual(config.consolidationChunkChars, 4000);
     assert.strictEqual(config.failureInjectionEnabled, true);
     assert.strictEqual(config.failureInjectionMaxAgeDays, 7);
     assert.strictEqual(config.failureInjectionMaxEntries, 5);
@@ -40,6 +42,17 @@ describe("loadConfig", () => {
     assert.strictEqual(config.llmThinkingOverride, undefined);
     assert.strictEqual(config.standingInstructionsEnabled, true);
     assert.strictEqual(config.quickCheckOnOpen, true);
+  });
+
+  it("parses consolidationChunking / consolidationChunkChars with the min-500 guard", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunking: true, consolidationChunkChars: 2000 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunking, true);
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunkChars, 2000);
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunkChars: 100 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunkChars, 4000, "values below the 500 floor are ignored");
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunkChars: "big" }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunkChars, 4000, "non-numeric values are ignored");
   });
 
   it("honors a configured consolidationTimeoutMs, warning only when it is below the default", () => {
