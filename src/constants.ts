@@ -35,6 +35,14 @@ export const DEFAULT_FLUSH_RECENT_MESSAGES = 0;
  * including lower ones; `loadConfig` warns when a value below this is set.
  */
 export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 600000;
+/** Default prompt budget (chars) per chunked consolidation round. */
+export const DEFAULT_CONSOLIDATION_CHUNK_CHARS = 4000;
+/** Default state of chunked subprocess consolidation (off = legacy single-shot). */
+export const DEFAULT_CONSOLIDATION_CHUNKING = false;
+/** Minimum accepted consolidationChunkChars value; smaller values are ignored. */
+export const CONSOLIDATION_CHUNK_CHARS_MIN = 500;
+/** Built-in cap on chunked consolidation rounds (bounded by the shared time budget too). */
+export const MAX_CONSOLIDATION_ROUNDS = 6;
 /**
  * Minimum gap between auto-consolidation attempts per target. Without this a
  * store left over-cap by a failed/instant-killed run re-schedules on every
@@ -394,7 +402,7 @@ SKILL FORMAT:
 - description: one-line summary of when to use it
 - body: structured with sections — ## When to Use, ## Procedure, ## Pitfalls, ## Verification
 - Prefer structured fields over raw markdown when possible:
-  - when_to_use: trigger conditions and boundaries
+  - when_to_use: expanded trigger conditions and boundaries. Renders into the skill body and does not participate in Pi's skill index — discoverable trigger signals belong in description.
   - procedure_steps: ordered concrete steps
   - pitfalls: caveats or failure modes
   - verification_steps: checks that prove success
@@ -404,9 +412,9 @@ ONE-SHOT EXAMPLE:
 {
   "action": "create",
   "name": "debug-typescript-errors",
-  "description": "Debug TypeScript build failures in this repo",
+  "description": "Debug TypeScript build failures in this repo: tsc --noEmit errors, type-check failures in the workspace or CI.",
   "scope": "project",
-  "when_to_use": "Use when TypeScript fails in this repo's workspace or CI.",
+  "when_to_use": "Use when pnpm tsc --noEmit fails locally or in CI, or when asked to fix TypeScript build errors here. Not for runtime-only type issues.",
   "procedure_steps": [
     "Run pnpm tsc --noEmit to get the full error list.",
     "Fix dependency or config errors before leaf-module errors.",

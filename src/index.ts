@@ -163,6 +163,13 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!persistenceInitialized) {
       try {
+        // Startup reconciles the global files plus the current project only:
+        // a full sweep over every projects-memory folder serialized
+        // concurrent startups on the shared mutation-lock database.
+        // /memory-sync-markdown remains the repair path for other scopes.
+        const startupProject = ctx?.cwd
+          ? detectProject(config.projectsMemoryDir, ctx.cwd).name
+          : null;
         await migrateThenSyncMarkdownMemories(
           dbManager,
           shouldMigrateExtensionRoot ? legacyGlobalDir : null,
@@ -170,6 +177,7 @@ export default function (pi: ExtensionAPI) {
           config.projectsMemoryDir,
           agentRoot,
           {
+            onlyProjects: startupProject ? [startupProject] : [],
             onMigrationSucceeded: () => {
               databaseMigrationPending = false;
               dbManager.setOpenGuard(null);
@@ -298,7 +306,7 @@ export default function (pi: ExtensionAPI) {
       // Failures go to the consolidation log file, not the terminal (the user
       // asked for a clean console; the retry/self-healing path already handles
       // recovery, and the log keeps the details greppable).
-      appendConsolidationLog(`[hermes-memory] auto-consolidation failed for '${toolTarget}': ${result.error ?? "no reason reported"}`);
+      appendConsolidationLog(`[hermes-memory] auto-consolidation ${result.partial ? "partially " : ""}failed for '${toolTarget}': ${result.error ?? "no reason reported"}`);
     }
     return result;
   };

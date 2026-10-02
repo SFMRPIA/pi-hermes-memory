@@ -12,6 +12,9 @@ import {
   DEFAULT_REVIEW_RECENT_MESSAGES,
   DEFAULT_FLUSH_RECENT_MESSAGES,
   DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  DEFAULT_CONSOLIDATION_CHUNK_CHARS,
+  DEFAULT_CONSOLIDATION_CHUNKING,
+  CONSOLIDATION_CHUNK_CHARS_MIN,
   DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
   DEFAULT_VAULT_PROMOTE_THRESHOLD,
@@ -63,6 +66,8 @@ const DEFAULT_CONFIG: MemoryConfig = {
   failureInjectionMaxAgeDays: DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   failureInjectionMaxEntries: DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
   consolidationTimeoutMs: DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  consolidationChunking: DEFAULT_CONSOLIDATION_CHUNKING,
+  consolidationChunkChars: DEFAULT_CONSOLIDATION_CHUNK_CHARS,
   standingInstructionsEnabled: true,
   memorySearchRecencyWeight: DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT,
   vaultPromoteThreshold: DEFAULT_VAULT_PROMOTE_THRESHOLD,
@@ -125,6 +130,14 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       if (isStringArray(parsed.correctionWeakPatterns)) config.correctionWeakPatterns = parsed.correctionWeakPatterns;
       if (isStringArray(parsed.correctionNegativePatterns)) config.correctionNegativePatterns = parsed.correctionNegativePatterns;
       if (isStringArray(parsed.correctionDirectiveWords)) config.correctionDirectiveWords = parsed.correctionDirectiveWords;
+      if (typeof parsed.consolidationChunking === "boolean") {
+        config.consolidationChunking = parsed.consolidationChunking;
+      }
+      if (typeof parsed.consolidationChunkChars === "number"
+        && Number.isFinite(parsed.consolidationChunkChars)
+        && parsed.consolidationChunkChars >= CONSOLIDATION_CHUNK_CHARS_MIN) {
+        config.consolidationChunkChars = parsed.consolidationChunkChars;
+      }
       if (typeof parsed.consolidationTimeoutMs === "number") {
         config.consolidationTimeoutMs = parsed.consolidationTimeoutMs;
         if (parsed.consolidationTimeoutMs < DEFAULT_CONSOLIDATION_TIMEOUT_MS) {

@@ -86,6 +86,15 @@ export interface MemoryConfig {
   nudgeToolCalls: number;
   /** Maximum time in milliseconds for a consolidation run, auto or manual. Default: 180000 */
   consolidationTimeoutMs: number;
+  /**
+   * Enables chunked subprocess consolidation (bounded rounds with a shared
+   * time budget). Default: false — the legacy single-shot behavior applies
+   * until explicitly enabled. Provisional pending reproduction of the
+   * original timeout on a faster model.
+   */
+  consolidationChunking?: boolean;
+  /** Prompt budget (chars) per chunked consolidation round. Min 500, default 4000. */
+  consolidationChunkChars?: number;
   /** Inject pinned STANDING.md instructions into every session. Default: true */
   standingInstructionsEnabled: boolean;
   /** Blend of recency vs FTS relevance in memory_search ranking. 0 = pure relevance, 1 = pure recency. Default: 0.4 */
@@ -133,6 +142,21 @@ export interface ConsolidationResult {
   consolidated: boolean;
   /** Error message if consolidation failed */
   error?: string;
+  /**
+   * True when at least one round completed but the run ended with a failure
+   * or the store is still over its capacity goal. Progress is real and on
+   * disk; retriggering continues from current state.
+   */
+  partial?: boolean;
+  /** Number of subprocess consolidation rounds completed (chunked path only). */
+  rounds?: number;
+  /**
+   * Set when another session already holds the consolidation lock for this
+   * target (or the session was replaced mid-run) — nothing is broken, the
+   * work happens elsewhere, so callers should ask for a retry instead of
+   * surfacing an error.
+   */
+  deferred?: boolean;
 }
 
 export type SkillScope = "global" | "project";

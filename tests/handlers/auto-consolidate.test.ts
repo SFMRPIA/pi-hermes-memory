@@ -2,7 +2,7 @@
  * Unit tests for auto-consolidation — triggerConsolidation and /memory-consolidate command.
  */
 
-import { describe, it, beforeEach, before, after } from "node:test";
+import { describe, it, beforeEach, afterEach, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -12,7 +12,8 @@ import { registerConsolidateCommand, triggerConsolidation } from "../../src/hand
 import { resolveWatchedChildPiInvocation } from "../../src/handlers/pi-child-process.js";
 import { MemoryStore } from "../../src/store/memory-store.js";
 import { AtomicLockCoordinator } from "../../src/store/atomic-lock-coordinator.js";
-import { DEFAULT_CONSOLIDATION_TIMEOUT_MS, ENTRY_DELIMITER } from "../../src/constants.js";
+import { DEFAULT_CONSOLIDATION_TIMEOUT_MS, DEFAULT_CONSOLIDATION_CHUNK_CHARS, ENTRY_DELIMITER } from "../../src/constants.js";
+import { takeChunk } from "../../src/handlers/auto-consolidate.js";
 
 // ─── Mock infrastructure ───
 
@@ -94,6 +95,13 @@ const mockStore = {
   getAllFailureEntries: () => ["failure lesson 1", "failure lesson 2"],
   getStorageIdentity: async (target: string) => path.join("mock-store", target),
   loadFromDisk: async () => {},
+  // Mechanics tests exercise the subprocess handshake, so the fixture store
+  // reports itself over its capacity goal — a healthy store would clean-no-op
+  // before spawning a child.
+  capacityGoal: () => 10,
+  capacityUsage: () => 1000,
+  // Tiny limits keep the fork's under-80% skip from eating the spawn asserts.
+  config: { memoryCharLimit: 20, userCharLimit: 1 },
 } as any;
 
 async function settle(ms = 10) {
@@ -907,5 +915,361 @@ describe("MemoryStore auto-consolidation integration", () => {
     assert.ok(!result.error, result.error ?? "");
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(calls, 1, "the consolidator must still be invoked in the background");
+  });
+});
+
+// ─── Chunked subprocess consolidation (#236) ───
+
+function parsePromptBatch(prompt: string): string[] {
+  const marker = "--- Current Memory Entries ---";
+  const start = prompt.indexOf(marker);
+  assert.ok(start >= 0, "prompt should contain the entries section");
+  const end = prompt.indexOf("Use the memory tool", start);
+  const body = prompt.slice(start + marker.length, end);
+  return body
+    .split(ENTRY_DELIMITER)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0 && entry !== "(empty)");
+}
+
+async function removeEntryFromDisk(store: MemoryStore, strippedText: string): Promise<void> {
+  const filePath = path.join((store as unknown as { memoryDir: string }).memoryDir, "MEMORY.md");
+  const raw = await fs.readFile(filePath, "utf-8");
+  const blocks = raw.split(ENTRY_DELIMITER);
+  const marker = strippedText.slice(0, 40);
+  const kept = blocks.filter((block) => !block.includes(marker));
+  assert.ok(kept.length < blocks.length, `child should find entry '${marker}' in the store file`);
+  await fs.writeFile(filePath, kept.join(ENTRY_DELIMITER), "utf-8");
+}
+
+describe("chunked subprocess consolidation", () => {
+  let MEMORY_ROOT = "";
+  let storeSeq = 0;
+
+  before(async () => {
+    MEMORY_ROOT = await fs.mkdtemp(path.join(os.tmpdir(), "pi-consolidation-chunk-"));
+  });
+
+  after(async () => {
+    try { await fs.rm(MEMORY_ROOT, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  beforeEach(async () => {
+    execCalls = [];
+    // Fresh lock dir per test: the shared lock file couples otherwise
+    // independent tests through lease-release timing on Windows.
+    process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR = await fs.mkdtemp(
+      path.join(os.tmpdir(), "pi-consolidation-locks-"),
+    );
+  });
+
+  afterEach(async () => {
+    const dir = process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR;
+    if (dir) {
+      try { await fs.rm(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  /** Real on-disk store in its own fresh directory, policy-only so seeds can exceed the cap. */
+  async function makeOverChunkStore(entryCount: number, entryChars = 600, memoryCharLimit = 5000): Promise<MemoryStore> {
+    const memoryDir = path.join(MEMORY_ROOT, `store-${++storeSeq}`);
+    const store = new MemoryStore({
+      memoryCharLimit,
+      userCharLimit: 100,
+      memoryMode: "policy-only",
+      nudgeInterval: 10,
+      reviewEnabled: false,
+      flushOnCompact: false,
+      flushOnShutdown: false,
+      flushMinTurns: 6,
+      autoConsolidate: false,
+      correctionDetection: false,
+      nudgeToolCalls: 15,
+      memoryDir,
+    } as never);
+    // Seed via raw file writes: the fork enforces the char cap on add() even
+    // in policy-only mode, and the child simulation must match on-disk state.
+    const date = "2026-08-17";
+    const seeded: string[] = [];
+    for (let i = 0; i < entryCount; i++) {
+      const filler = "y".repeat(Math.max(0, entryChars - `chunk-entry-${i}-`.length));
+      seeded.push(`chunk-entry-${i}-${filler} <!-- created=${date}, last=${date} -->`);
+    }
+    await fs.mkdir(memoryDir, { recursive: true });
+    await fs.writeFile(path.join(memoryDir, "MEMORY.md"), seeded.join(ENTRY_DELIMITER), "utf-8");
+    await store.loadFromDisk();
+    return store;
+  }
+
+  /** Mock child that edits the store FILE on disk like the real subprocess, scripted per round. */
+  function createChunkedChildPi(store: MemoryStore, script: Array<"shrink" | "noop" | "fail">) {
+    let round = 0;
+    return {
+      on: () => {},
+      exec: async (...args: any[]) => {
+        execCalls.push(captureExecArgs(args));
+        const action = script[Math.min(round, script.length - 1)];
+        round++;
+        if (action === "fail") {
+          return { code: 124, stdout: "", stderr: "", killed: true };
+        }
+        if (action === "shrink") {
+          const prompt = execCalls[execCalls.length - 1][1].at(-1) as string;
+          const batch = parsePromptBatch(prompt);
+          assert.ok(batch.length > 0, "child prompt should contain at least one entry");
+          await removeEntryFromDisk(store, batch[0]);
+        }
+        return { code: 0, stdout: "Consolidated", stderr: "" };
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as any;
+  }
+
+  function batchFromExecCall(call: any[]): string[] {
+    return parsePromptBatch(call[1].at(-1) as string);
+  }
+
+  /**
+   * Stub store WITHOUT the fork's squeezeToCap/dedupeTarget pre-pass: the
+   * chunked walk only gets work when those deterministic shrinkers leave the
+   * store over its capacity goal. Mirrors the upstream test fixture so the
+   * ported walk logic is exercised directly.
+   */
+  function makeStubStore(entries: string[], goal = 5000) {
+    const state = { entries: [...entries] };
+    return {
+      state,
+      getMemoryEntries: () => [...state.entries],
+      getUserEntries: () => [],
+      getAllFailureEntries: () => [],
+      getStorageIdentity: async (t: string) => path.join("stub-store", t),
+      loadFromDisk: async () => {},
+      capacityGoal: () => goal,
+      capacityUsage: () => state.entries.join(ENTRY_DELIMITER).length,
+    } as any;
+  }
+
+  /** Mock child that removes the first presented entry each round, like a merging child. */
+  function createStubChildPi(store: ReturnType<typeof makeStubStore>, script: Array<"shrink" | "noop" | "fail">) {
+    let round = 0;
+    return {
+      on: () => {},
+      exec: async (...args: any[]) => {
+        execCalls.push(captureExecArgs(args));
+        const action = script[Math.min(round, script.length - 1)];
+        round++;
+        if (action === "fail") {
+          return { code: 124, stdout: "", stderr: "", killed: true };
+        }
+        if (action === "shrink") {
+          const prompt = execCalls[execCalls.length - 1][1].at(-1) as string;
+          const batch = parsePromptBatch(prompt);
+          assert.ok(batch.length > 0, "child prompt should contain at least one entry");
+          const idx = store.state.entries.indexOf(batch[0]);
+          assert.ok(idx >= 0, "presented entry must exist in the store");
+          store.state.entries.splice(idx, 1);
+        }
+        return { code: 0, stdout: "Consolidated", stderr: "" };
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as any;
+  }
+
+  function batchFromExecCall(call: any[]): string[] {
+    return parsePromptBatch(call[1].at(-1) as string);
+  }
+
+  function stubEntries(count: number, entryChars = 600): string[] {
+    const date = "2026-08-17";
+    const out: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const filler = "y".repeat(Math.max(0, entryChars - `chunk-entry-${i}-`.length));
+      out.push(`chunk-entry-${i}-${filler} <!-- created=${date}, last=${date} -->`);
+    }
+    return out;
+  }
+
+  it("takeChunk packs entries up to the budget; an oversized entry travels alone", () => {
+    const small = ["aaaa", "bbbb", "cccc"]; // 4 chars + ENTRY_DELIMITER.length each
+    assert.deepStrictEqual(takeChunk(small, 100), small, "everything fits one chunk");
+    const unit = "aaaa".length + ENTRY_DELIMITER.length;
+    assert.deepStrictEqual(takeChunk(small, unit * 2), ["aaaa", "bbbb"], "budget packing");
+    assert.deepStrictEqual(takeChunk(small, unit), ["aaaa"], "exact fit");
+    const big = ["z".repeat(50)];
+    assert.deepStrictEqual(takeChunk(big, 10), big, "oversized entry travels alone so the loop always makes progress");
+  });
+
+  it("treats a small healthy store as a clean no-op", async () => {
+    const store = await makeOverChunkStore(2, 20);
+    const pi = createMockPi();
+
+    const result = await triggerConsolidation(pi, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true });
+
+    assert.strictEqual(execCalls.length, 0, "a healthy store spawns no child");
+    assert.strictEqual(result.consolidated, true);
+    assert.strictEqual(result.rounds, 0);
+    assert.strictEqual(result.error, undefined);
+  });
+
+  it("completes an over-goal store in bounded rounds with a shared time budget", async () => {
+    const store = makeStubStore(stubEntries(10)); // ≈ 6507 encoded chars > 5000 goal
+    const pi = createStubChildPi(store, ["shrink", "shrink", "shrink"]);
+
+    const result = await triggerConsolidation(pi, store as unknown as MemoryStore, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true });
+
+    // Each round removes one entry (−650 encoded chars): 6507 → 5857 → 5207 →
+    // 4557 ≤ goal. The walk advances past each consumed slice.
+    assert.strictEqual(execCalls.length, 3);
+    assert.strictEqual(result.consolidated, true);
+    assert.strictEqual(result.rounds, 3);
+    assert.ok(!result.partial, "goal met with no failure is a clean run");
+    assert.strictEqual(result.error, undefined, "goal met with no failure carries no error");
+    assert.strictEqual(store.state.entries.length, 7);
+    for (const call of execCalls) {
+      const batch = batchFromExecCall(call);
+      const batchChars = batch.join(ENTRY_DELIMITER).length;
+      assert.ok(batchChars <= DEFAULT_CONSOLIDATION_CHUNK_CHARS, `round prompt ${batchChars} must fit one chunk`);
+    }
+  });
+
+  it("keeps walking forward: round 2 slices after round 1's slice, not from the top", async () => {
+    const store = makeStubStore(stubEntries(10));
+    const batches: string[][] = [];
+    const pi: any = {
+      on: () => {},
+      exec: async (...args: any[]) => {
+        execCalls.push(captureExecArgs(args));
+        const prompt = execCalls[execCalls.length - 1][1].at(-1) as string;
+        const batch = parsePromptBatch(prompt);
+        batches.push(batch);
+        const idx = store.state.entries.indexOf(batch[0]);
+        if (idx >= 0) store.state.entries.splice(idx, 1);
+        return { code: 0, stdout: "Consolidated", stderr: "" };
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    };
+
+    await triggerConsolidation(pi, store as unknown as MemoryStore, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true });
+
+    assert.ok(batches.length >= 2, "expected multiple rounds");
+    // The discriminating check vs an offset-reset mutant: the walk must move
+    // FORWARD — round 2 starts after round 1's slice. Later rounds may revisit
+    // entries after index shifts (documented approximation).
+    const overlap = batches[1].filter((entry) => batches[0].includes(entry));
+    assert.strictEqual(overlap.length, 0, `round 2 re-processed ${overlap.length} entries from round 1 — the walk must advance`);
+  });
+
+  it("resumes after a killed round: partial progress persists and a second trigger finishes", async () => {
+    const store = makeStubStore(stubEntries(11));
+    const pi = createStubChildPi(store, ["shrink", "fail"]);
+
+    const first = await triggerConsolidation(pi, store as unknown as MemoryStore, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", {
+      consolidationChunkChars: 2500,
+      consolidationChunking: true,
+    });
+
+    assert.strictEqual(execCalls.length, 2, "round 1 succeeds, round 2 is killed");
+    assert.strictEqual(first.consolidated, true, "one completed round is real progress on disk");
+    assert.strictEqual(first.partial, true, "a killed run must not read as a clean success");
+    assert.strictEqual(first.rounds, 1);
+    assert.ok(first.error?.includes("terminated"), first.error);
+    assert.ok(first.error?.includes("1 earlier round shrank the store"), first.error);
+    assert.strictEqual(store.state.entries.length, 10, "the killed run did not roll back its completed round");
+
+    // Second trigger resumes from current state.
+    execCalls = [];
+    const pi2 = createStubChildPi(store, ["shrink", "shrink"]);
+    const second = await triggerConsolidation(pi2, store as unknown as MemoryStore, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", {
+      consolidationChunkChars: 2500,
+      consolidationChunking: true,
+    });
+
+    assert.strictEqual(second.consolidated, true);
+    assert.ok(!second.partial);
+    assert.strictEqual(store.state.entries.length, 7, "resume finishes the shrink below the capacity goal");
+  });
+
+  it("reports out-of-scope disappearances instead of resurrecting them", async () => {
+    const store = makeStubStore(stubEntries(10));
+    const base = createStubChildPi(store, ["shrink", "shrink", "shrink"]);
+    let shrankRounds = 0;
+    const originalExec = base.exec;
+    const pi: any = {
+      on: () => {},
+      exec: async (...args: any[]) => {
+        const ret = await originalExec(...args);
+        shrankRounds++;
+        if (shrankRounds === 2) {
+          // Another session removes an entry that was NOT in the presented slice.
+          const idx = store.state.entries.findIndex((e: string) => e.includes("chunk-entry-9"));
+          if (idx >= 0) store.state.entries.splice(idx, 1);
+        }
+        return ret;
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    };
+
+    const result = await triggerConsolidation(pi, store as unknown as MemoryStore, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true });
+
+    const allNotes = result.error ?? "";
+    assert.ok(
+      allNotes.includes("out-of-scope") || result.partial !== true,
+      `out-of-scope disappearance must be reported: ${allNotes}`,
+    );
+    // The removed entry must NOT be resurrected by the consolidation loop.
+    assert.strictEqual(
+      store.state.entries.filter((e: string) => e.includes("chunk-entry-9")).length,
+      0,
+      "out-of-scope deletions stay deleted — no resurrection",
+    );
+  });
+
+  it("single-shot stays byte-identical when chunking is off (default), with the remedy hint on timeout", async () => {
+    // 8 entries ≈ 4853 chars: above the 80% skip line (4000), under the cap
+    // (no squeeze), over the 4000 chunk threshold (remedy hint applies).
+    const store = await makeOverChunkStore(8, 560);
+    const oversizedPi = {
+      on: () => {},
+      exec: async (...args: any[]) => {
+        execCalls.push(captureExecArgs(args));
+        return { code: 124, stdout: "", stderr: "", killed: true };
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as any;
+
+    // Flag off (default): one unscoped whole-store child.
+    const result = await triggerConsolidation(oversizedPi, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", {});
+
+    assert.strictEqual(execCalls.length, 1, "legacy single-shot runs exactly one child");
+    const prompt = childPrompt(execCalls[0]);
+    assert.ok(prompt.includes("chunk-entry-0") && prompt.includes("chunk-entry-7"), "single-shot prompt carries the whole store");
+    assert.ok(!prompt.includes("covers ONLY the entries listed above"), "single-shot is unscoped");
+    assert.strictEqual(result.consolidated, false);
+    assert.ok(result.error?.includes("terminated"), result.error);
+    assert.ok(
+      result.error?.includes("consolidationChunking"),
+      "the timeout error teaches the chunking remedy",
+    );
+  });
+
+  it("defers instead of failing when pi.exec throws a stale extension ctx error", async () => {
+    const stalePi = {
+      on: () => {},
+      exec: async () => { throw new Error("This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession()"); },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as any;
+
+    const result = await triggerConsolidation(stalePi, mockStore, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true });
+
+    assert.strictEqual(result.consolidated, false);
+    assert.strictEqual(result.deferred, true, "stale ctx should defer, not fail");
+    assert.ok(!result.error!.includes("Consolidation failed"), "should not report a failure");
+    assert.ok(result.error!.includes("session replaced or reloaded"), "should explain the skip");
   });
 });
