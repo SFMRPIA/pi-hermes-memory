@@ -208,6 +208,16 @@ export class MemoryStore {
    * produces. O(n²) but stores are small and this is consolidation/add-time only.
    */
   async dedupeTarget(target: "memory" | "user" | "failure"): Promise<number> {
+    let removed = 0;
+    await this.runTargetMutation(target, async () => {
+      removed = await this.dedupeUnlocked(target);
+      return { success: true };
+    });
+    return removed;
+  }
+
+  private async dedupeUnlocked(target: "memory" | "user" | "failure"): Promise<number> {
+    await this.syncTargetFromDiskIfChanged(target);
     const entries = this.entriesFor(target);
     const kept: string[] = [];
     const keptNorms: string[] = [];
@@ -237,6 +247,16 @@ export class MemoryStore {
    * then removed from hot. Returns count squeezed. Deterministic, no LLM.
    */
   async squeezeToCap(target: "memory" | "user" | "failure"): Promise<number> {
+    let squeezed = 0;
+    await this.runTargetMutation(target, async () => {
+      squeezed = await this.squeezeUnlocked(target);
+      return { success: true };
+    });
+    return squeezed;
+  }
+
+  private async squeezeUnlocked(target: "memory" | "user" | "failure"): Promise<number> {
+    await this.syncTargetFromDiskIfChanged(target);
     const limit = this.charLimit(target);
     let squeezed = 0;
     while (this.charCount(target) > limit && this.entriesFor(target).length > 1) {
@@ -253,6 +273,8 @@ export class MemoryStore {
       const [evicted] = entries.splice(oldestIdx, 1);
       squeezed++;
       // Best-effort vault archive: append the evicted text to vault's squeezed log
+      // ponytail: archive pre-save (no data-loss window); a conflict retry may
+      // double-archive evicted entries to the append-log vault — rare, tolerated.
       try {
         const vaultPath = (this.config as unknown as { vaultPath?: string }).vaultPath?.trim();
         if (vaultPath) {
