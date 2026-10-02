@@ -402,7 +402,7 @@ SKILL FORMAT:
 - description: one-line summary of when to use it
 - body: structured with sections — ## When to Use, ## Procedure, ## Pitfalls, ## Verification
 - Prefer structured fields over raw markdown when possible:
-  - when_to_use: trigger conditions and boundaries
+  - when_to_use: expanded trigger conditions and boundaries. Renders into the skill body and does not participate in Pi's skill index — discoverable trigger signals belong in description.
   - procedure_steps: ordered concrete steps
   - pitfalls: caveats or failure modes
   - verification_steps: checks that prove success
@@ -412,9 +412,9 @@ ONE-SHOT EXAMPLE:
 {
   "action": "create",
   "name": "debug-typescript-errors",
-  "description": "Debug TypeScript build failures in this repo",
+  "description": "Debug TypeScript build failures in this repo: tsc --noEmit errors, type-check failures in the workspace or CI.",
   "scope": "project",
-  "when_to_use": "Use when TypeScript fails in this repo's workspace or CI.",
+  "when_to_use": "Use when pnpm tsc --noEmit fails locally or in CI, or when asked to fix TypeScript build errors here. Not for runtime-only type issues.",
   "procedure_steps": [
     "Run pnpm tsc --noEmit to get the full error list.",
     "Fix dependency or config errors before leaf-module errors.",
