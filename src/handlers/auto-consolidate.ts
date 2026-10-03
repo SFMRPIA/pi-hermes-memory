@@ -118,6 +118,32 @@ function describeConsolidationFailure(
   return `Consolidation process exited with code ${result.code}: ${stderr?.slice(0, 200) || "unknown error"}`;
 }
 
+// ─── Auto-run TUI helpers (pure, exported for tests) ───
+// The automatic over-capacity path is silent by design (failures go to the
+// consolidation log file), so index.ts surfaces it via a footer status line
+// and — on real failure — a single warning toast. These helpers keep the
+// strings/classification testable without touching triggerConsolidation.
+
+/** Footer status text while a consolidation run is in flight. */
+export function consolidationStatusText(
+  toolTarget: ToolMemoryTarget,
+): string {
+  return `🧹 memory consolidating — ${toolTarget}…`;
+}
+
+/** True when the run was skipped because another run holds the lock. A skip is
+ * benign (the waiter observes it in the log); it must never toast as failure. */
+export function isConsolidationSkipError(result: ConsolidationResult): boolean {
+  return (result.error ?? "").startsWith("Consolidation still in progress for target");
+}
+
+/** Failure reason short enough for one toast line: newlines and whitespace
+ * runs collapsed, hard-capped at 120 chars, empty → "no reason reported". */
+export function shortConsolidationFailureReason(reason?: string): string {
+  const collapsed = String(reason ?? "").replace(/[\r\n]+/g, " ").replace(/\s{2,}/g, " ").trim();
+  return collapsed.slice(0, 120) || "no reason reported";
+}
+
 /** A round shorter than this cannot plausibly boot a child and merge anything. */
 const MIN_ROUND_MS = 10_000;
 

@@ -24,7 +24,7 @@
 
 import * as path from "node:path";
 import * as fs from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "./store/memory-store.js";
 import { SkillStore } from "./store/skill-store.js";
 import { DatabaseManager } from "./store/db.js";
@@ -44,7 +44,7 @@ import { ensureDailyNote, vaultConfigured, todayStr } from "./handlers/vault-not
 import { setupBackgroundReview } from "./handlers/background-review.js";
 import { setupSessionFlush } from "./handlers/session-flush.js";
 import { registerInsightsCommand } from "./handlers/insights.js";
-import { triggerConsolidation, registerConsolidateCommand } from "./handlers/auto-consolidate.js";
+import { triggerConsolidation, registerConsolidateCommand, consolidationStatusText, isConsolidationSkipError, shortConsolidationFailureReason } from "./handlers/auto-consolidate.js";
 import { appendConsolidationLog } from "./handlers/consolidation-log.js";
 import { setupCorrectionDetector } from "./handlers/correction-detector.js";
 import { registerSkillsCommand } from "./handlers/skills-command.js";
@@ -277,13 +277,38 @@ export default function (pi: ExtensionAPI) {
   // /memory-consolidate and tests call triggerConsolidation directly and keep
   // their per-target lock semantics.
   let autoConsolidationTail: Promise<unknown> = Promise.resolve();
+
+  // ── Auto-run TUI feedback — footer status line while a run is in flight,
+  // one warning toast on real failure. Pure UI: zero LLM cost. pi itself has
+  // no `.ui` (only ExtensionContext does), so the freshest context is captured
+  // via agent_start; every UI call is best-effort try/catch for stale ctx,
+  // mirroring the manual command's notify pattern. Contention skips are not
+  // failures and never toast.
+  const uiFeedbackOn = config.consolidationUiFeedback !== false;
+  type ConsolidationUi = ExtensionContext["ui"];
+  let consolidationUi: ConsolidationUi | null = null;
+  const showConsolidationStatus = (feedbackToolTarget: "memory" | "user" | "failure" | "project"): void => {
+    try {
+      if (!uiFeedbackOn) return;
+      consolidationUi?.setStatus("hermes-consolidation", consolidationStatusText(feedbackToolTarget));
+    } catch { /* stale ctx — best effort */ }
+  };
+  const clearConsolidationStatus = (): void => {
+    try { consolidationUi?.setStatus("hermes-consolidation", undefined); } catch { /* ignore */ }
+  };
+  pi.on("agent_start", (_event, ctx) => {
+    if (uiFeedbackOn && ctx.hasUI) consolidationUi = ctx.ui;
+  });
+
   const runAutoConsolidation = async (
     target: "memory" | "user" | "failure",
     targetStore: MemoryStore,
     toolTarget: "memory" | "user" | "failure" | "project",
     signal?: AbortSignal,
   ) => {
-    const run = () => triggerConsolidation(
+    const run = () => {
+      showConsolidationStatus(toolTarget);
+      return triggerConsolidation(
       pi,
       targetStore,
       target,
@@ -293,24 +318,39 @@ export default function (pi: ExtensionAPI) {
       config,
       undefined,
       dbManager,
-    );
+      );
+    };
     const previous = autoConsolidationTail;
     let release!: () => void;
     autoConsolidationTail = new Promise<void>((resolve) => { release = resolve; });
-    const result = await previous.then(run).finally(release);
+    let resultConsolidation: Awaited<ReturnType<typeof triggerConsolidation>>;
+    try {
+      resultConsolidation = await previous.then(run).finally(release);
+    } finally {
+      clearConsolidationStatus();
+    }
     // The subprocess child rewrites the store files on disk; the parent's
     // in-memory entries would otherwise stay stale and re-publish the old set
     // on the next write (the regrowth loop). Reload so memory == disk.
-    if (result.consolidated) {
+    if (resultConsolidation.consolidated) {
       await targetStore.loadFromDisk();
     }
-    if (!result.consolidated) {
-      // Failures go to the consolidation log file, not the terminal (the user
-      // asked for a clean console; the retry/self-healing path already handles
-      // recovery, and the log keeps the details greppable).
-      appendConsolidationLog(`[hermes-memory] auto-consolidation ${result.partial ? "partially " : ""}failed for '${toolTarget}': ${result.error ?? "no reason reported"}`);
+    if (!resultConsolidation.consolidated) {
+      // Failures go to the consolidation log file, not the terminal dump; the log
+      // keeps the details greppable. UI additionally shows exactly ONE warning
+      // toast with a short reason — EXCEPT for benign lock-contention skips,
+      // which only clear (the footer status is cleared in the finally above).
+      appendConsolidationLog(`[hermes-memory] auto-consolidation ${resultConsolidation.partial ? "partially " : ""}failed for '${toolTarget}': ${resultConsolidation.error ?? "no reason reported"}`);
+      if (uiFeedbackOn && !isConsolidationSkipError(resultConsolidation)) {
+        try {
+          consolidationUi?.notify(
+            `⚠️ auto-consolidation failed for '${toolTarget}': ${shortConsolidationFailureReason(resultConsolidation.error)}`,
+            "warning",
+          );
+        } catch { /* stale ctx — best effort */ }
+      }
     }
-    return result;
+    return resultConsolidation;
   };
 
   store.setConsolidator((target, signal) => runAutoConsolidation(target, store, target, signal));

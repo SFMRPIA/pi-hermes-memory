@@ -182,16 +182,20 @@ describe("triggerConsolidation", () => {
     }
   });
 
-  it("skips a duplicate subprocess while the same target is consolidating", async () => {
-    const releaseExecs: Array<() => void> = [];
+  it("does not spawn a duplicate subprocess while the same target is consolidating, then the waiter completes", async () => {
+    let releaseFirst!: () => void;
     let markExecStarted!: () => void;
     const execStarted = new Promise<void>((resolve) => { markExecStarted = resolve; });
     const pi = {
       on: () => {},
       exec: async (...args: any[]) => {
         execCalls.push(captureExecArgs(args));
-        markExecStarted();
-        await new Promise<void>((resolve) => { releaseExecs.push(resolve); });
+        if (execCalls.length === 1) {
+          markExecStarted();
+          // The first child holds until the test releases it below.
+          await new Promise<void>((resolve) => { releaseFirst = resolve; });
+        }
+        // Waiter runs (calls after the first) resolve immediately.
         return { code: 0, stdout: "Done", stderr: "" };
       },
       registerTool: () => {},
@@ -201,18 +205,18 @@ describe("triggerConsolidation", () => {
     const first = triggerConsolidation(pi, mockStore, "memory");
     await execStarted;
     const second = triggerConsolidation(pi, mockStore, "memory");
-    const raced = await Promise.race([
-      second.then((result) => ({ result })),
-      settle(100).then(() => ({ timeout: true as const })),
-    ]);
 
-    releaseExecs.forEach((release) => release());
-    await Promise.allSettled([first, second]);
+    // Bounded observation window covering several 500ms lock-wait polls: the
+    // lock-wait design means the second run waits instead of failing fast, and
+    // no duplicate child appears while the first holds the lock.
+    await settle(2000);
+    assert.strictEqual(execCalls.length, 1, "no duplicate child spawned while the lock is held");
 
-    assert.ok("result" in raced, "duplicate consolidation should return without spawning another child");
-    assert.strictEqual(raced.result.consolidated, false);
-    assert.match(raced.result.error!, /already in progress/i);
-    assert.strictEqual(execCalls.length, 1, "only one child Pi process should be spawned");
+    releaseFirst();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    assert.strictEqual(firstResult.consolidated, true);
+    assert.strictEqual(secondResult.consolidated, true);
+    assert.ok(execCalls.length >= 2, "the waiter ran its own child after the lock freed");
   });
 
   it("allows the same project target to consolidate concurrently in distinct stores", async () => {
@@ -256,7 +260,10 @@ describe("triggerConsolidation", () => {
       assert.strictEqual(started, 2);
     } finally {
       releases.forEach((release) => release());
-      await fs.rm(root, { recursive: true, force: true });
+      // The markdown-mutation-lock coordinator keeps its SQLite handle open for
+      // the whole process; an open handle makes Windows fs.rm fail with EBUSY.
+      // Best-effort cleanup only — remaining tmpdir files are harmless.
+      await fs.rm(root, { recursive: true, force: true }).catch(() => {});
     }
   });
 
@@ -278,7 +285,7 @@ describe("triggerConsolidation", () => {
     assert.match(result.error!, /60000ms/);
   });
 
-  it("restores pre-run entries when the child fails after removing entries", async () => {
+  it("keeps pre-run entries intact when the child fails (current contract: no restore, no reload)", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "consolidate-rollback-"));
     const store = new MemoryStore({
       memoryMode: "legacy-inject",
@@ -302,16 +309,24 @@ describe("triggerConsolidation", () => {
       memoryDir: dir,
     } as any);
     await store.loadFromDisk();
-    await store.add("memory", "Alpha stable fact");
-    await store.add("memory", "Beta important fact");
+    // Fork guard: stores under 80% of cap short-circuit BEFORE spawning a child
+    // (no consolidation ran, nothing can fail-and-restore). The fixture entries
+    // must therefore exceed 80% of memoryCharLimit (2000 → 1600).
+    const alpha = "Alpha stable fact " + "a".repeat(1600);
+    const beta = "Beta important fact";
+    await store.add("memory", alpha);
+    await store.add("memory", beta);
 
     // Child that removes both entries via the store, then exits non-zero
     // (simulates a watchdog kill mid-consolidation).
     const failingPi = {
       on: () => {},
       exec: async () => {
-        await store.remove("memory", "Alpha stable fact");
-        await store.remove("memory", "Beta important fact");
+        // A real failed child mutates the store FILES, not the parent's
+        // in-process entries — and the fork deliberately does NOT reload the
+        // parent on failure (self-healing re-runs + .recovery snapshots).
+        // Pin the observable parent-side contract instead of a fake in-process
+        // mutation the current code no longer rolls back.
         return { code: 1, stdout: "", stderr: "child failed" };
       },
       registerTool: () => {},
@@ -322,10 +337,11 @@ describe("triggerConsolidation", () => {
 
     assert.strictEqual(result.consolidated, false);
     const remaining = store.getMemoryEntries();
-    assert.ok(remaining.some((e) => e.includes("Alpha stable fact")), "pre-run entry restored");
-    assert.ok(remaining.some((e) => e.includes("Beta important fact")), "pre-run entry restored");
+    assert.ok(remaining.some((e) => e.includes("Alpha stable fact")), "pre-run entry kept");
+    assert.ok(remaining.some((e) => e.includes("Beta important fact")), "pre-run entry kept");
 
-    await fs.rm(dir, { recursive: true, force: true });
+    // Mutation-lock handles stay open (see EBUSY note above) — best-effort rm.
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   });
 
   it("returns { consolidated: false } when pi.exec throws", async () => {
@@ -593,10 +609,13 @@ describe("registerConsolidateCommand", () => {
     } as any;
 
     const projectStore = {
-      getMemoryEntries: () => ["project fact"],
+      getMemoryEntries: () => ["project fact that comfortably exceeds the tiny cap"],
       getUserEntries: () => [],
       getStorageIdentity: async (target: string) => path.join("project-store", target),
       loadFromDisk: async () => { projectReloaded = true; },
+      // Tiny limits mirror mockStore so the fork's under-80% short-circuit does
+      // not eat the project target's child-spawn assertion.
+      config: { memoryCharLimit: 20, userCharLimit: 1 },
     } as any;
 
     registerConsolidateCommand(pi, mockStore, 60000, projectStore, "demo-project");

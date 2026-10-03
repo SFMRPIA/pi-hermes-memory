@@ -86,6 +86,8 @@ export interface MemoryConfig {
   nudgeToolCalls: number;
   /** Maximum time in milliseconds for a consolidation run, auto or manual. Default: 180000 */
   consolidationTimeoutMs: number;
+  /** Show a footer status line while auto consolidation runs and one warning toast on real failure. Default: true */
+  consolidationUiFeedback?: boolean;
   /**
    * Enables chunked subprocess consolidation (bounded rounds with a shared
    * time budget). Default: false — the legacy single-shot behavior applies
