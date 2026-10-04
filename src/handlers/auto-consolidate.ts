@@ -199,8 +199,10 @@ export function takeChunk(entries: string[], chunkChars: number): string[] {
 
 /**
  * Run one consolidation pass: child LLM merges entries via the memory tool.
- * On failure (non-zero exit, timeout/kill, or exception) the pre-run entries
- * are restored so a partial run cannot leave the store empty.
+ * On failure (non-zero exit, timeout/kill, or exception) there is no rollback:
+ * the round keeps its on-disk progress (re-adding removed rows would fight
+ * legitimate dedup and ping-pong across triggers) and the store's `.recovery`
+ * snapshots are the repair backstop.
  */
 export async function triggerConsolidation(
   pi: ExtensionAPI,

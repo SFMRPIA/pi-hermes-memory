@@ -9,7 +9,7 @@ import path from "node:path";
 import { registerMemoryTool } from "../../src/tools/memory-tool.js";
 import { MemoryStore } from "../../src/store/memory-store.js";
 import { DatabaseManager } from "../../src/store/db.js";
-import { getMemories, syncMemoryEntry } from "../../src/store/sqlite-memory-store.js";
+import { getMemories, syncMemoryEntry, searchMemories, reconcileMarkdownMemoryScope } from "../../src/store/sqlite-memory-store.js";
 import { ENTRY_DELIMITER, MEMORY_FILE } from "../../src/constants.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -527,5 +527,80 @@ describe("registerMemoryTool", () => {
     await capturedResult.execute("tc-1", { action: "remove", target: "memory", old_text: "old entry" }, undefined as any, undefined as any, undefined as any);
 
     assert.deepStrictEqual(removeArgs, ["memory", "old entry"], "should pass target, old_text to store.remove");
+  });
+
+  it("force-repairs named-project FTS gaps on observer notifications, never global scopes", async () => {
+    type MutationObserverFn = (target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>;
+
+    // Named project scope: fingerprint + row count unchanged, one FTS row lost.
+    const projectEntries = ["project needle entry", "project companion entry"];
+    reconcileMarkdownMemoryScope(dbManager, projectEntries, "memory", "project-a");
+    assert.strictEqual(searchMemories(dbManager, "needle", { project: "project-a" }).length, 1);
+
+    const lost = dbManager.getDb().prepare(
+      "SELECT id, content FROM memories WHERE content = 'project needle entry'",
+    ).get() as { id: number; content: string };
+    dbManager.getDb().prepare(
+      "INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', ?, ?)",
+    ).run(lost.id, lost.content);
+    assert.strictEqual(
+      searchMemories(dbManager, "needle", { project: "project-a" }).length,
+      0,
+      "the FTS gap must hide the entry before the observer runs",
+    );
+
+    let projectObserver: MutationObserverFn | undefined;
+    const projectStore = {
+      setMutationObserver: (fn: MutationObserverFn) => { projectObserver = fn; },
+    } as unknown as MemoryStore;
+    const mockPiA = { registerTool: () => {} } as unknown as ExtensionAPI;
+    registerMemoryTool(mockPiA, {} as MemoryStore, projectStore, dbManager, "project-a");
+
+    await projectObserver!("memory", projectEntries);
+    assert.strictEqual(
+      searchMemories(dbManager, "needle", { project: "project-a" }).length,
+      1,
+      "a named-project notification must force-repair a same-count FTS gap",
+    );
+
+    // Global scope keeps the non-forced shortcut: the same drift must stay hidden.
+    const globalEntries = ["global needle entry", "global filler entry"];
+    reconcileMarkdownMemoryScope(dbManager, globalEntries, "memory", null);
+    assert.strictEqual(searchMemories(dbManager, "needle", { project: null }).length, 1);
+
+    const lostGlobal = dbManager.getDb().prepare(
+      "SELECT id, content FROM memories WHERE content = 'global needle entry'",
+    ).get() as { id: number; content: string };
+    dbManager.getDb().prepare(
+      "INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', ?, ?)",
+    ).run(lostGlobal.id, lostGlobal.content);
+    assert.strictEqual(searchMemories(dbManager, "needle", { project: null }).length, 0, "global FTS gap setup");
+
+    let globalObserver: MutationObserverFn | undefined;
+    const globalStore = {
+      setMutationObserver: (fn: MutationObserverFn) => { globalObserver = fn; },
+    } as unknown as MemoryStore;
+    const mockPiB = { registerTool: () => {} } as unknown as ExtensionAPI;
+    registerMemoryTool(mockPiB, globalStore, {} as MemoryStore, dbManager);
+    await globalObserver!("memory", globalEntries);
+    assert.strictEqual(
+      searchMemories(dbManager, "needle", { project: null }).length,
+      0,
+      "the global observer must keep the non-forced shortcut",
+    );
+
+    // A blank project name maps to the global scope and must not force it.
+    let blankObserver: MutationObserverFn | undefined;
+    const blankProjectStore = {
+      setMutationObserver: (fn: MutationObserverFn) => { blankObserver = fn; },
+    } as unknown as MemoryStore;
+    const mockPiC = { registerTool: () => {} } as unknown as ExtensionAPI;
+    registerMemoryTool(mockPiC, {} as MemoryStore, blankProjectStore, dbManager, "   ");
+    await blankObserver!("memory", globalEntries);
+    assert.strictEqual(
+      searchMemories(dbManager, "needle", { project: null }).length,
+      0,
+      "a blank project name must not force the global scope",
+    );
   });
 });

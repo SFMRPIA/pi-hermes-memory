@@ -200,11 +200,16 @@ async function reconcileStoreScope(
       return null;
     }
     const target = sqliteTargetFor(rawTarget);
+    // Named project writes force the reconcile so the unchanged-hash/count
+    // shortcut cannot skip a same-count FTS-only gap; repair rides the
+    // project's next write. Globals/failures keep the fast path.
+    const force = rawTarget === "project" && Boolean(projectName?.trim());
     reconcileMarkdownMemoryScope(
       dbManager,
       entries,
       target,
       sqliteProjectFor(rawTarget, projectName) ?? null,
+      force ? { force: true } : undefined,
     );
     return null;
   } catch (err) {
