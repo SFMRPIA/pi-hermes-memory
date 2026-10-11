@@ -68,6 +68,8 @@ const DEFAULT_CONFIG: MemoryConfig = {
   consolidationTimeoutMs: DEFAULT_CONSOLIDATION_TIMEOUT_MS,
   consolidationChunking: DEFAULT_CONSOLIDATION_CHUNKING,
   consolidationChunkChars: DEFAULT_CONSOLIDATION_CHUNK_CHARS,
+  usageHitTrackingEnabled: true,
+  consolidationUsageSignals: true,
   consolidationUiFeedback: true,
   standingInstructionsEnabled: true,
   memorySearchRecencyWeight: DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT,
@@ -140,6 +142,8 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
         config.consolidationChunkChars = parsed.consolidationChunkChars;
       }
       if (typeof parsed.consolidationUiFeedback === "boolean") config.consolidationUiFeedback = parsed.consolidationUiFeedback;
+      if (typeof parsed.usageHitTrackingEnabled === "boolean") config.usageHitTrackingEnabled = parsed.usageHitTrackingEnabled;
+      if (typeof parsed.consolidationUsageSignals === "boolean") config.consolidationUsageSignals = parsed.consolidationUsageSignals;
       if (typeof parsed.consolidationTimeoutMs === "number") {
         config.consolidationTimeoutMs = parsed.consolidationTimeoutMs;
         if (parsed.consolidationTimeoutMs < DEFAULT_CONSOLIDATION_TIMEOUT_MS) {

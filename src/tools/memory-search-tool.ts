@@ -4,7 +4,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DatabaseManager } from '../store/db.js';
-import { searchMemories, getMemoryStats } from '../store/sqlite-memory-store.js';
+import { searchMemories, getMemoryStats, recordSearchHits } from '../store/sqlite-memory-store.js';
 import type { MemoryCategory, MemoryConfig } from '../types.js';
 import { vaultConfigured } from "../handlers/vault-notes.js";
 
@@ -48,7 +48,12 @@ Returns matching memory entries with their mutation target, scope, and dates. Th
       const project = args.project;
       const target = args.target;
       const category = args.category as MemoryCategory | undefined;
-      const limit = Math.min(args.limit || 10, 20);
+      // Bounded: omitted/invalid → 10, above 20 → 20. A raw negative limit
+      // would disable SQL LIMIT entirely (SQLite treats it as no limit).
+      const rawLimit = args.limit;
+      const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && Number.isInteger(rawLimit) && rawLimit >= 1
+        ? Math.min(rawLimit, 20)
+        : 10;
 
       if (!query || query.trim().length === 0) {
         const result: SearchResult = { success: false, message: 'query is required' };
@@ -62,6 +67,18 @@ Returns matching memory entries with their mutation target, scope, and dates. Th
       }
 
       const results = searchMemories(dbManager, query, { project, target, category, limit, recencyWeight });
+
+      // Usage-hit tracking (the promotion-gate data for consolidation): one
+      // batched counter UPDATE per search. Must never break the read path.
+      // Vault fallback hits (below) are deliberately NOT counted — they are not
+      // SQLite hot-store entries, so they have no per-entry row to attach data to.
+      if (results.length > 0 && config?.usageHitTrackingEnabled !== false) {
+        try {
+          recordSearchHits(dbManager, results.map((entry) => entry.id));
+        } catch (err) {
+          console.warn(`[pi-hermes-memory] usage-hit recording failed (search result unaffected): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
 
       if (results.length === 0) {
         // Hot had no hit — fall back warm → cold so squeezed history stays

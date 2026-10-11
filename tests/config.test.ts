@@ -496,4 +496,37 @@ describe("llmFallbackModels parsing (#215/#219)", () => {
     assert.strictEqual(config.llmModelOverride, "p1/m1");
     assert.strictEqual(config.llmFallbackModels, undefined);
   });
+
+  it("defaults usage-hit tracking and consolidation usage signals to enabled", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({}));
+
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.usageHitTrackingEnabled, true);
+    assert.strictEqual(config.consolidationUsageSignals, true);
+  });
+
+  it("accepts usageHitTrackingEnabled and consolidationUsageSignals kill-switches", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      usageHitTrackingEnabled: false,
+      consolidationUsageSignals: false,
+    }));
+
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.usageHitTrackingEnabled, false);
+    assert.strictEqual(config.consolidationUsageSignals, false);
+  });
+
+  it("ignores non-boolean usage tracking values", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      usageHitTrackingEnabled: "yes",
+      consolidationUsageSignals: 1,
+    }));
+
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.usageHitTrackingEnabled, true);
+    assert.strictEqual(config.consolidationUsageSignals, true);
+  });
 });
