@@ -35,6 +35,14 @@ export const DEFAULT_FLUSH_RECENT_MESSAGES = 0;
  * including lower ones; `loadConfig` warns when a value below this is set.
  */
 export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 600000;
+/** Default prompt budget (chars) per chunked consolidation round. */
+export const DEFAULT_CONSOLIDATION_CHUNK_CHARS = 4000;
+/** Default state of chunked subprocess consolidation (off = legacy single-shot). */
+export const DEFAULT_CONSOLIDATION_CHUNKING = false;
+/** Minimum accepted consolidationChunkChars value; smaller values are ignored. */
+export const CONSOLIDATION_CHUNK_CHARS_MIN = 500;
+/** Built-in cap on chunked consolidation rounds (bounded by the shared time budget too). */
+export const MAX_CONSOLIDATION_ROUNDS = 6;
 /**
  * Minimum gap between auto-consolidation attempts per target. Without this a
  * store left over-cap by a failed/instant-killed run re-schedules on every
@@ -57,6 +65,17 @@ export const MEMORY_FILE = "MEMORY.md";
 export const USER_FILE = "USER.md";
 export const STANDING_FILE = "STANDING.md";
 
+// ─── Markdown→SQLite sync state ───
+/**
+ * Key prefix for per-scope reconcile fingerprints in `extension_metadata`.
+ * Bump the version whenever `parseMarkdownMemoryEntry` or the reconcile body
+ * changes what a fingerprinted scope should produce — a stored fingerprint
+ * cannot see a parser change, so the prefix is what invalidates every scope.
+ * The corruption-rebuild strip reads this same constant, so bumping it keeps
+ * both sides in step.
+ */
+export const MDSYNC_METADATA_KEY_PREFIX = "mdsync:v1:";
+
 // ─── Standing instructions (#121) ───
 // A hard budget, deliberately separate from memoryCharLimit/userCharLimit.
 // These are injected in every mode including policy-only, so the cost has to
@@ -78,7 +97,7 @@ Memory write targets:
 - failure: failures, corrections, insights, conventions, preferences, and tool quirks captured as categorized lessons.
 
 memory_search filters:
-- target accepts "memory", "user", or "failure".
+- target accepts "memory", "user", "failure", or "project" (project-attributed memory entries).
 - project filters project-scoped memories by project name.
 - category filters categorized failure/lesson memories only.
 
@@ -92,7 +111,7 @@ Accepted memory categories:
 
 Search guidance:
 - For user preferences, search target="user" with concrete terms from the request.
-- For project conventions or repo decisions, search with the current project filter and concrete terms from the request.
+- For project conventions or repo decisions, search with the current project filter and concrete terms from the request; when the project name is unknown, search target="project" to match project-attributed memories regardless of name.
 - For debugging, test failures, build errors, or repeated mistakes, search target="failure" and categories "failure", "correction", "insight", or "tool-quirk".
 - For general durable learnings, search target="memory" with concrete terms from the request.
 - Use category only for categorized failure/lesson searches; ordinary user, global, and project memories may not have a category.
@@ -184,16 +203,17 @@ Only act if there's something genuinely worth saving. If nothing stands out, jus
 // (review/flush/consolidation/correction all ask the model to respond with
 // this same {"operations":[...]} shape instead of calling the memory tool,
 // since direct mode is a single completeSimple() call with no tool loop).
+//
+// GUARD: this schema must not contain a parseable operations example.
+// The direct transports fall back to parsing the thinking channel (#197),
+// so a model restating this schema in its chain of thought would have any
+// valid example parsed into a live operation. Show the shape only in prose
+// or with a deliberately unparseable placeholder, and keep the empty
+// {"operations":[]} (in the prompts below) as the only literal example.
+// No angle-bracket placeholders either — those are still valid JSON that
+// models copy into real operations.
 const DIRECT_MEMORY_OPERATIONS_SCHEMA = `Respond with JSON only (no markdown fences):
-{
-  "operations": [
-    {
-      "action": "add",
-      "target": "memory",
-      "content": "entry text"
-    }
-  ]
-}
+{"operations": [ /* one operation object per entry, using the fields below */ ]}
 
 Operation fields:
 - action: "add" | "replace" | "remove"
@@ -201,7 +221,9 @@ Operation fields:
 - content: required for add/replace
 - old_text: required for replace/remove (substring match)
 - category: for failure target — failure | correction | insight | convention | tool-quirk | preference
-- failure_reason: optional context for failure entries`;
+- failure_reason: optional context for failure entries
+
+Put the JSON in the assistant text, not only in thinking.`;
 
 export const DIRECT_REVIEW_SYSTEM_PROMPT = `You review coding conversations and extract durable memories worth saving across sessions.
 
@@ -380,7 +402,7 @@ SKILL FORMAT:
 - description: one-line summary of when to use it
 - body: structured with sections — ## When to Use, ## Procedure, ## Pitfalls, ## Verification
 - Prefer structured fields over raw markdown when possible:
-  - when_to_use: trigger conditions and boundaries
+  - when_to_use: expanded trigger conditions and boundaries. Renders into the skill body and does not participate in Pi's skill index — discoverable trigger signals belong in description.
   - procedure_steps: ordered concrete steps
   - pitfalls: caveats or failure modes
   - verification_steps: checks that prove success
@@ -390,9 +412,9 @@ ONE-SHOT EXAMPLE:
 {
   "action": "create",
   "name": "debug-typescript-errors",
-  "description": "Debug TypeScript build failures in this repo",
+  "description": "Debug TypeScript build failures in this repo: tsc --noEmit errors, type-check failures in the workspace or CI.",
   "scope": "project",
-  "when_to_use": "Use when TypeScript fails in this repo's workspace or CI.",
+  "when_to_use": "Use when pnpm tsc --noEmit fails locally or in CI, or when asked to fix TypeScript build errors here. Not for runtime-only type issues.",
   "procedure_steps": [
     "Run pnpm tsc --noEmit to get the full error list.",
     "Fix dependency or config errors before leaf-module errors.",

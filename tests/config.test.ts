@@ -31,6 +31,8 @@ describe("loadConfig", () => {
     assert.strictEqual(config.memoryOverflowStrategy, "auto-consolidate");
     assert.strictEqual(config.autoConsolidate, true);
     assert.strictEqual(config.consolidationTimeoutMs, 600000);
+    assert.strictEqual(config.consolidationChunking, false);
+    assert.strictEqual(config.consolidationChunkChars, 4000);
     assert.strictEqual(config.failureInjectionEnabled, true);
     assert.strictEqual(config.failureInjectionMaxAgeDays, 7);
     assert.strictEqual(config.failureInjectionMaxEntries, 5);
@@ -38,6 +40,19 @@ describe("loadConfig", () => {
     assert.deepStrictEqual(config.sessionSearch, { variant: "legacy" });
     assert.strictEqual(config.llmModelOverride, undefined);
     assert.strictEqual(config.llmThinkingOverride, undefined);
+    assert.strictEqual(config.standingInstructionsEnabled, true);
+    assert.strictEqual(config.quickCheckOnOpen, true);
+  });
+
+  it("parses consolidationChunking / consolidationChunkChars with the min-500 guard", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunking: true, consolidationChunkChars: 2000 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunking, true);
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunkChars, 2000);
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunkChars: 100 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunkChars, 4000, "values below the 500 floor are ignored");
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ consolidationChunkChars: "big" }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).consolidationChunkChars, 4000, "non-numeric values are ignored");
   });
 
   it("honors a configured consolidationTimeoutMs, warning only when it is below the default", () => {
@@ -81,6 +96,7 @@ describe("loadConfig", () => {
       projectsMemoryDir: "my-memory",
       llmModelOverride: " openrouter/deepseek/deepseek-v4-flash ",
       llmThinkingOverride: "minimal",
+      quickCheckOnOpen: false,
     }));
     const config = loadConfig(TEST_CONFIG_PATH);
     assert.strictEqual(config.memoryMode, "legacy-inject");
@@ -96,9 +112,16 @@ describe("loadConfig", () => {
     assert.strictEqual(config.projectsMemoryDir, "my-memory");
     assert.strictEqual(config.llmModelOverride, "openrouter/deepseek/deepseek-v4-flash");
     assert.strictEqual(config.llmThinkingOverride, "minimal");
+    assert.strictEqual(config.quickCheckOnOpen, false);
     // Unset values use defaults
     assert.strictEqual(config.userCharLimit, 5000);
     assert.strictEqual(config.reviewEnabled, true);
+  });
+
+  it("only accepts boolean quickCheckOnOpen overrides", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ quickCheckOnOpen: "false" }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).quickCheckOnOpen, true);
   });
 
   it("handles partial config (missing keys use defaults)", () => {
@@ -425,5 +448,52 @@ describe("loadConfig", () => {
     assert.strictEqual(config.correctionWeakPatterns, undefined);
     assert.strictEqual(config.correctionNegativePatterns, undefined);
     assert.strictEqual(config.correctionDirectiveWords, undefined);
+  });
+});
+
+describe("llmFallbackModels parsing (#215/#219)", () => {
+  afterEach(() => {
+    fs.rmSync(TEST_CONFIG_PATH, { force: true });
+  });
+
+  it("merges array-form override tails with explicit llmFallbackModels", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      llmModelOverride: ["p1/m1", "p2/m2"],
+      llmFallbackModels: ["p3/m3"],
+    }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.llmModelOverride, "p1/m1");
+    assert.deepStrictEqual(config.llmFallbackModels, ["p2/m2", "p3/m3"]);
+  });
+
+  it("trims, drops empties, and dedupes llmFallbackModels", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      llmModelOverride: "p1/m1",
+      llmFallbackModels: ["p2/m2", " p2/m2 ", "", "p3/m3"],
+    }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.deepStrictEqual(config.llmFallbackModels, ["p2/m2", "p3/m3"]);
+  });
+
+  it("accepts legacy llmModelFallbacks / fallbackModels aliases additively", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      llmModelOverride: "p1/m1",
+      llmFallbackModels: ["p2/m2"],
+      llmModelFallbacks: ["p3/m3"],
+      fallbackModels: ["p3/m3", "p4/m4"],
+    }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.deepStrictEqual(config.llmFallbackModels, ["p2/m2", "p3/m3", "p4/m4"]);
+  });
+
+  it("leaves the chain unset when no fallback fields are present", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ llmModelOverride: "p1/m1" }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.llmModelOverride, "p1/m1");
+    assert.strictEqual(config.llmFallbackModels, undefined);
   });
 });

@@ -41,4 +41,27 @@ describe('registerMemorySearchTool', () => {
 
     dbManager.close();
   });
+  // Ported from upstream #213 — adapted to the fork's own result format
+  // (emoji + [project] labels) instead of upstream's scope=/[target=] format.
+  it('accepts target "project" as a filter', async () => {
+    const dbManager = makeDbManager();
+    addMemory(dbManager, 'project deployment convention', 'memory', 'project-a');
+    addMemory(dbManager, 'global deployment convention');
+    addMemory(dbManager, 'project failure deployment lesson', 'failure', 'project-a');
+
+    let captured: any;
+    registerMemorySearchTool({ registerTool: (def: any) => { captured = def; } } as any, dbManager);
+
+    assert.ok(captured.parameters.properties.target.enum.includes('project'));
+
+    const result = await captured.execute('tc-1', { query: 'deployment', target: 'project' });
+    const text = result.content[0].text;
+
+    assert.strictEqual(result.details.success, true);
+    assert.strictEqual(result.details.count, 1);
+    assert.match(text, /🧠 \[project-a\] project deployment convention/);
+    assert.doesNotMatch(text, /\[global\]/);
+
+    dbManager.close();
+  });
 });

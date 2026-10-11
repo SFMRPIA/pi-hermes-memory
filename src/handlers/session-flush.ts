@@ -15,7 +15,7 @@ import { DIRECT_FLUSH_SYSTEM_PROMPT, ENTRY_DELIMITER, FLUSH_PROMPT } from "../co
 import type { MemoryConfig } from "../types.js";
 import { collectMessageParts } from "./message-parts.js";
 import { execChildPrompt } from "./pi-child-process.js";
-import { runDirectMemoryCompletion, usesDirectTransport } from "./review-memory-ops.js";
+import { runDirectMemoryCompletion, readSessionId, usesDirectTransport } from "./review-memory-ops.js";
 
 function buildDirectFlushUserPrompt(
   store: MemoryStore,
@@ -92,6 +92,7 @@ export function setupSessionFlush(
             config,
             timeoutMs,
             signal,
+            sessionId: readSessionId(ctx.sessionManager),
           },
           dbManager,
           projectName,

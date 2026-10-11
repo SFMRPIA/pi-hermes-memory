@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — fork fix: stale-view resurrection
+
+### Added
+
+- **Chunked subprocess consolidation (upstream #236)** behind the new `consolidationChunking` flag (default off — upstream's maintainer decision, legacy single-shot stays byte-identical): over-`consolidationChunkChars` stores run bounded goal-driven rounds sharing one overall `consolidationTimeoutMs` budget; the walk advances past consumed slices, skips no-progress slices, runs an unscoped decisive round when the remaining store fits one prompt, reports partial progress (`partial` + `rounds` on `ConsolidationResult`, surfaced by `/memory-consolidate` and the auto-consolidation log), and **reports** out-of-scope deletions instead of resurrecting them. Note: the fork's deterministic squeeze+dedupe pre-pass already keeps over-cap stores under the cap, so the walk is the parity safety net for stores that slip past it (e.g. squeeze disabled by lock contention), not the primary shrink path.
+- **Scoped startup markdown sync (upstream #265)**: session-start reconciles only the global files plus the current project (`onlyProjects`); `/memory-sync-markdown` keeps the full sweep as the repair path. Boot cost no longer scales with the projects-memory folder count.
+- **Skill discovery trigger signals (upstream #244/#249)**: skill-tool `description` guidance now points discovery signals at description (Pi indexes by that field alone); `when_to_use` docs updated to match.
+- **Deferred process-incarnation probe (upstream #247)**: the atomic-lock coordinator no longer probes its own incarnation (a ~0.5–1.4s Windows helper spawn) at module import; it is memoized on first lock use.
+
+### Deliberately skipped
+
+- #258 (capEnforced header gating): the fork enforces caps unconditionally — there is no policy-only label drift to fix.
+- #256 (ambient Bedrock credentials): the fork's `ResolvedRequestAuth` requires an apiKey downstream; porting would rework the auth plumbing for zero value on key-based providers.
+- #273 (pi-tui peer dep): already present in the fork's package.json.
+
+### Fixed
+
+- **Multi-process stale-view resurrection in the memory store** (fork-discovered): `dedupeTarget` and `squeezeToCap` were the only mutators that skipped the pre-save `syncTargetFromDiskIfChanged` reload and ran bare `saveToDisk` outside the markdown-mutation lock — their conflict-skip paths (the logged `cap squeeze skipped: Error` / `pre-chunk dedup skipped: Error`) left pruned state diverged from disk, and concurrent pi windows/consolidation children resurrected pruned entries on their next whole-file save. Both now route through `runTargetMutation` (lock + sync-first reload + bounded retry), mirroring `removeUnlocked`; consolidations finally shrink the store durably. Vault archive stays pre-save — a conflict retry may append a duplicate "Squeezed from" line to the append-log vault (rare, tolerated).
+
+## [Unreleased] — fork port of upstream v0.9.7–v0.9.9 Tier 2 (fallback + thinking recovery)
+
+### Added
+
+- **`llmFallbackModels` chain for direct completions** (upstream [#215](https://github.com/chandra447/pi-hermes-memory/pull/215) + [#219](https://github.com/chandra447/pi-hermes-memory/pull/219)): when the primary review/flush/correction model fails (auth, provider, transport, parse), the chain walks `llmFallbackModels` in order; caller abort always stops the chain; per-model timeout fallthrough preserved; config accepts array-form `llmModelOverride` (first = primary, rest = fallbacks) plus legacy aliases `llmModelFallbacks`/`fallbackModels`, all trimmed + deduped. Default unset = exactly the previous single-model behavior.
+- **Thinking-channel output recovery** (upstream [#235](https://github.com/chandra447/pi-hermes-memory/pull/235)): when a provider parks the whole answer in its thinking channel (e.g. vLLM `DEFAULT_THINKING=max`), operations are recovered from balanced spans scanned end-first; the winner's trailing-ness is the trust boundary (trailing = full actions, non-trailing draft = adds only, trailing-empty = settle empty without reach-back); redacted-only completions settle `empty_response` instead of burning the subprocess.
+- **One-time provider misconfiguration notice** (upstream [#239](https://github.com/chandra447/pi-hermes-memory/pull/239)): a single per-process warning when the answer-channel is empty while the payload sits in the thinking channel, naming the provider/model.
+
+### Fixed
+
+- **Empty-response double-spend stop** (upstream [#235](https://github.com/chandra447/pi-hermes-memory/pull/235)): a clean stop with nothing usable settles `empty_response`, walks configured fallbacks first, and never reaches the subprocess (the same model would fail the same way). Auto-consolidation treats it as terminal — no lock, no child (parity hunk; inert in this fork while `directCtx` is always null). Truncated responses still retry via parse_error.
+- **Shared extraction hardening** (upstream [#235](https://github.com/chandra447/pi-hermes-memory/pull/235)): extraction candidates are validated on their `operations` array and declined candidates fall through instead of claiming the parse; direct prompts no longer contain a parseable operations example (GUARD in `src/constants.ts`) so a schema echo in chain-of-thought cannot become a live operation; `REVIEW_COMPLETION_TIMEOUT_MS` (120s) replaces scattered literals.
+
+## [Unreleased] — fork port of upstream v0.9.7–v0.9.9 Tier 1
+
+### Fixed
+
+- **`memory_search` accepts `target: "project"`** (upstream [#213](https://github.com/chandra447/pi-hermes-memory/pull/213)): schema + search SQL now accept the fourth target value, resolving to `target = 'memory' AND project IS NOT NULL`, matching the `[target=project]` labels the `memory` tool writes; guidance text updated. Includes the short-CJK literal fallback the fix rides on. Fork keeps its own emoji/`[project]` result format and bm25+recency ranking.
+- **`quickCheckOnOpen` setting** (upstream [#220](https://github.com/chandra447/pi-hermes-memory/pull/220)): default `true` (current behavior); `false` skips the async startup `PRAGMA quick_check`. Operation-time corruption recovery stays enabled either way.
+
+### Changed
+
+- **better-sqlite3 `^13.0.3`** (upstream [#205](https://github.com/chandra447/pi-hermes-memory/pull/205)): clean process exit on Node 24 (12.x ObjectWrap destructor could SIGABRT at shutdown after all work completed).
+
+### Performance
+
+- **Startup markdown→SQLite reconcile is fingerprint-gated per scope** (upstream [#227](https://github.com/chandra447/pi-hermes-memory/issues/227) / [#233](https://github.com/chandra447/pi-hermes-memory/pull/233)): unchanged markdown scopes skip per-entry SQL (upstream measured 2.1–7.2 s per startup on large stores); fingerprint (markdown bytes + row count) lives in `extension_metadata`, written in the same transaction as the reconcile; `/memory-sync-markdown` remains the forced full repair. Brings `src/lifecycle-timing.ts` (PI_TIMING-gated utility) as the commit's dependency. Not ported: the FTS-degradation test path — it requires upstream #184's error-degradation behavior, which is out of Tier-1 scope.
+
+### Added
+
+- **`x-opencode-session` header on direct background completions** (upstream [#250](https://github.com/chandra447/pi-hermes-memory/issues/250) / [#259](https://github.com/chandra447/pi-hermes-memory/pull/259)): review/flush/correction direct transports send the real Pi session id, scoped to `opencode`/`opencode-go` providers + `opencode.ai` host, so the OpenCode gateway stops rejecting them with `400 missing_session_id`; an operator-configured session header wins and is never overwritten; a missing session id degrades to the previous behavior. Adapted to the fork's signatures (sessionId flows via `RunDirectMemoryCompletionOptions`).
+
 ## [0.9.2] - 2026-07-30
 
 ### Fixed

@@ -12,6 +12,9 @@ import {
   DEFAULT_REVIEW_RECENT_MESSAGES,
   DEFAULT_FLUSH_RECENT_MESSAGES,
   DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  DEFAULT_CONSOLIDATION_CHUNK_CHARS,
+  DEFAULT_CONSOLIDATION_CHUNKING,
+  CONSOLIDATION_CHUNK_CHARS_MIN,
   DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
   DEFAULT_VAULT_PROMOTE_THRESHOLD,
@@ -63,6 +66,9 @@ const DEFAULT_CONFIG: MemoryConfig = {
   failureInjectionMaxAgeDays: DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   failureInjectionMaxEntries: DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
   consolidationTimeoutMs: DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  consolidationChunking: DEFAULT_CONSOLIDATION_CHUNKING,
+  consolidationChunkChars: DEFAULT_CONSOLIDATION_CHUNK_CHARS,
+  consolidationUiFeedback: true,
   standingInstructionsEnabled: true,
   memorySearchRecencyWeight: DEFAULT_MEMORY_SEARCH_RECENCY_WEIGHT,
   vaultPromoteThreshold: DEFAULT_VAULT_PROMOTE_THRESHOLD,
@@ -71,6 +77,7 @@ const DEFAULT_CONFIG: MemoryConfig = {
   nudgeToolCalls: DEFAULT_NUDGE_TOOL_CALLS,
   projectsMemoryDir: DEFAULT_PROJECTS_MEMORY_DIR,
   sessionSearch: { variant: "legacy" },
+  quickCheckOnOpen: true,
 };
 
 export const DEFAULT_CONFIG_PATH = path.join(
@@ -124,6 +131,15 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       if (isStringArray(parsed.correctionWeakPatterns)) config.correctionWeakPatterns = parsed.correctionWeakPatterns;
       if (isStringArray(parsed.correctionNegativePatterns)) config.correctionNegativePatterns = parsed.correctionNegativePatterns;
       if (isStringArray(parsed.correctionDirectiveWords)) config.correctionDirectiveWords = parsed.correctionDirectiveWords;
+      if (typeof parsed.consolidationChunking === "boolean") {
+        config.consolidationChunking = parsed.consolidationChunking;
+      }
+      if (typeof parsed.consolidationChunkChars === "number"
+        && Number.isFinite(parsed.consolidationChunkChars)
+        && parsed.consolidationChunkChars >= CONSOLIDATION_CHUNK_CHARS_MIN) {
+        config.consolidationChunkChars = parsed.consolidationChunkChars;
+      }
+      if (typeof parsed.consolidationUiFeedback === "boolean") config.consolidationUiFeedback = parsed.consolidationUiFeedback;
       if (typeof parsed.consolidationTimeoutMs === "number") {
         config.consolidationTimeoutMs = parsed.consolidationTimeoutMs;
         if (parsed.consolidationTimeoutMs < DEFAULT_CONSOLIDATION_TIMEOUT_MS) {
@@ -161,9 +177,32 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       ) {
         config.sessionSearch = { variant: parsed.sessionSearch.variant };
       }
+      if (typeof parsed.quickCheckOnOpen === "boolean") config.quickCheckOnOpen = parsed.quickCheckOnOpen;
       if (typeof parsed.llmModelOverride === "string") {
         const trimmed = parsed.llmModelOverride.trim();
         if (trimmed.length > 0) config.llmModelOverride = trimmed;
+      }
+      // Support array form for primary override too (e.g. llmModelOverride: ["a/b","c/d"]) — first entry is primary, rest are fallbacks
+      if (Array.isArray(parsed.llmModelOverride) && parsed.llmModelOverride.every((v: unknown) => typeof v === "string")) {
+        const cleaned = (parsed.llmModelOverride as string[]).map((s) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) {
+          config.llmModelOverride = cleaned[0];
+          const fallbacks = cleaned.slice(1);
+          if (fallbacks.length > 0) config.llmFallbackModels = fallbacks;
+        }
+      }
+      if (isStringArray(parsed.llmFallbackModels)) {
+        const cleaned = (parsed.llmFallbackModels as string[]).map((s) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) config.llmFallbackModels = [...new Set([...(config.llmFallbackModels ?? []), ...cleaned])];
+      }
+      // Backward-compat alias: llmModelFallbacks / fallbackModels
+      if (isStringArray((parsed as Record<string, unknown>).llmModelFallbacks)) {
+        const cleaned = ((parsed as Record<string, unknown>).llmModelFallbacks as string[]).map((s: string) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) config.llmFallbackModels = [...new Set([...(config.llmFallbackModels ?? []), ...cleaned])];
+      }
+      if (isStringArray((parsed as Record<string, unknown>).fallbackModels)) {
+        const cleaned = ((parsed as Record<string, unknown>).fallbackModels as string[]).map((s: string) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) config.llmFallbackModels = [...new Set([...(config.llmFallbackModels ?? []), ...cleaned])];
       }
       if (isThinkingLevel(parsed.llmThinkingOverride)) config.llmThinkingOverride = parsed.llmThinkingOverride;
       if (typeof parsed.vaultPath === "string" && parsed.vaultPath.trim().length > 0) {
