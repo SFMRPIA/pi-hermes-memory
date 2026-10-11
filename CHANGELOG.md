@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — fork port of upstream v0.9.10 usage-hit tracking (#262)
+
+### Added
+
+- **Usage-hit tracking**: `memory_search` now records a per-entry recall counter (`hit_count`) and last-recall date (`last_hit_at`) on the SQLite mirror — one batched update per search, fail-open, and it never changes results or ranking. Vault fallback results are not counted.
+- **Usage Signals in consolidation** (behind `consolidationUsageSignals`, default `true`): direct and subprocess prompts (auto, manual, and chunked rounds — per presented batch) gain a capped section (top 20 recalled entries by recall count + capped never-recalled list, 80-char excerpts, remainder folded into summary lines) with tie-breaker-only guidance. Absent until at least one presented entry has been recalled, so stores without tracking history keep byte-identical prompts.
+- **`/memory-insights` usage section**: per scope (global memory, user profile, current project), shows "recalled / total" plus the top five entries by recall count with dates.
+- Config switches `usageHitTrackingEnabled` and `consolidationUsageSignals` (both default `true`, strict boolean parsing).
+- Schema: `hit_count` / `last_hit_at` columns on the memories mirror, added via legacy ALTER and carried through both legacy table-rebuild migrations.
+
 ## [Unreleased] — fork fix: stale-view resurrection
 
 ### Added

@@ -4,8 +4,70 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "../store/memory-store.js";
+import { DatabaseManager } from "../store/db.js";
+import { getMemoryUsageSignals, type MemoryUsageSignal } from "../store/sqlite-memory-store.js";
 
-export function registerInsightsCommand(pi: ExtensionAPI, store: MemoryStore, projectStore: MemoryStore | null, projectName: string): void {
+/** Entries shown in the usage section's top-recalled list. */
+const USAGE_TOP_ENTRIES = 5;
+/** Character cap for entry excerpts in the usage section. */
+const USAGE_EXCERPT_CHARS = 70;
+
+interface UsageScopeStats {
+  total: number;
+  tracked: number;
+  top: Array<{ content: string; signal: MemoryUsageSignal }>;
+}
+
+function usageExcerpt(content: string): string {
+  const flat = content.replace(/\s+/g, " ").trim();
+  return flat.length > USAGE_EXCERPT_CHARS
+    ? `${flat.slice(0, USAGE_EXCERPT_CHARS - 3)}...`
+    : flat;
+}
+
+/**
+ * Recall stats for one store scope. Fail-open: a null dbManager or any lookup
+ * error renders the insights command without the usage section.
+ */
+function usageScopeStats(dbManager: DatabaseManager | null, target: "memory" | "user" | "failure", project: string | null): UsageScopeStats | null {
+  if (!dbManager) return null;
+  try {
+    const signals = getMemoryUsageSignals(dbManager, { target, project });
+    const total = (dbManager.getDb().prepare(
+      "SELECT COUNT(*) as count FROM memories WHERE target = ? AND project IS ?",
+    ).get(target, project) as { count: number | bigint }).count;
+    const top = [...signals.entries()]
+      .sort((a, b) => b[1].hits - a[1].hits)
+      .slice(0, USAGE_TOP_ENTRIES)
+      .map(([content, signal]) => ({ content, signal }));
+    const numTotal = typeof total === "bigint" ? Number(total) : total;
+    return { total: numTotal, tracked: signals.size, top };
+  } catch {
+    return null;
+  }
+}
+
+function renderUsageScope(label: string, stats: UsageScopeStats | null): string[] {
+  if (!stats || stats.total === 0) return [];
+  const lines = [`  🔍 USAGE — ${label}: ${stats.tracked} of ${stats.total} entries recalled via memory_search`];
+  if (stats.top.length === 0) {
+    lines.push("  (no recorded recalls yet — usage accrues as memory_search runs)");
+  } else {
+    stats.top.forEach((entry, i) => {
+      lines.push(`  ${i + 1}. ${entry.signal.hits}x (last ${entry.signal.lastHit}) — ${usageExcerpt(entry.content)}`);
+    });
+  }
+  lines.push("");
+  return lines;
+}
+
+export function registerInsightsCommand(
+  pi: ExtensionAPI,
+  store: MemoryStore,
+  projectStore: MemoryStore | null,
+  projectName: string,
+  dbManager: DatabaseManager | null = null,
+): void {
   pi.registerCommand("memory-insights", {
     description: "Show what's stored in persistent memory",
     handler: async (_args, ctx) => {
@@ -35,6 +97,7 @@ export function registerInsightsCommand(pi: ExtensionAPI, store: MemoryStore, pr
         }
       }
       lines.push("");
+      lines.push(...renderUsageScope("global memory", usageScopeStats(dbManager, "memory", null)));
 
       // User section
       lines.push("  👤 USER PROFILE");
@@ -51,6 +114,7 @@ export function registerInsightsCommand(pi: ExtensionAPI, store: MemoryStore, pr
         }
       }
       lines.push("");
+      lines.push(...renderUsageScope("global user profile", usageScopeStats(dbManager, "user", null)));
 
       // Project section
       if (projectEntries !== null) {
@@ -68,6 +132,7 @@ export function registerInsightsCommand(pi: ExtensionAPI, store: MemoryStore, pr
           }
         }
         lines.push("");
+        lines.push(...renderUsageScope(`project memory (${projectName})`, usageScopeStats(dbManager, "memory", projectName || null)));
       }
 
       ctx.ui.notify(lines.join("\n"), "info");

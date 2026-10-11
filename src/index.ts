@@ -366,7 +366,7 @@ export default function (pi: ExtensionAPI) {
   setupCorrectionDetector(pi, store, projectStore, config, dbManager, projectName);
 
   // ── 9. Register commands ──
-  registerInsightsCommand(pi, store, projectStore, projectName);
+  registerInsightsCommand(pi, store, projectStore, projectName, dbManager);
   registerSkillsCommand(pi, skillStore);
   registerInterviewCommand(pi, store);
   registerSwitchProjectCommand(pi, config);
