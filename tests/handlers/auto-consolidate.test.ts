@@ -12,6 +12,8 @@ import { registerConsolidateCommand, triggerConsolidation } from "../../src/hand
 import { resolveWatchedChildPiInvocation } from "../../src/handlers/pi-child-process.js";
 import { MemoryStore } from "../../src/store/memory-store.js";
 import { AtomicLockCoordinator } from "../../src/store/atomic-lock-coordinator.js";
+import { DatabaseManager } from "../../src/store/db.js";
+import { addMemory, recordSearchHits } from "../../src/store/sqlite-memory-store.js";
 import { DEFAULT_CONSOLIDATION_TIMEOUT_MS, DEFAULT_CONSOLIDATION_CHUNK_CHARS, ENTRY_DELIMITER } from "../../src/constants.js";
 import { takeChunk } from "../../src/handlers/auto-consolidate.js";
 
@@ -1290,5 +1292,203 @@ describe("chunked subprocess consolidation", () => {
     assert.strictEqual(result.deferred, true, "stale ctx should defer, not fail");
     assert.ok(!result.error!.includes("Consolidation failed"), "should not report a failure");
     assert.ok(result.error!.includes("session replaced or reloaded"), "should explain the skip");
+  });
+});
+
+// ─── Usage signals (upstream #262 promotion gate) ───
+
+const SIGNAL_ENTRY_RECALLED = "usage-signal entry alpha — recalled by search often";
+const SIGNAL_ENTRY_NEVER = "usage-signal entry beta — never recalled by search";
+const SIGNALS_HEADER = "--- Usage Signals (memory_search recall tracking) ---";
+const SIGNALS_GUIDANCE = "Treat these as tie-breakers, not removal orders";
+
+function makeUsageStore(entries: string[]) {
+  return {
+    getMemoryEntries: () => [...entries],
+    getUserEntries: () => [],
+    getAllFailureEntries: () => [],
+    getStorageIdentity: async (target: string) => path.join("usage-store", target),
+    loadFromDisk: async () => {},
+    capacityGoal: () => 10,
+    capacityUsage: () => 1000,
+    // Tiny limit keeps the fork's under-80% skip from eating the spawn asserts.
+    config: { memoryCharLimit: 20, userCharLimit: 1 },
+  } as any;
+}
+
+function todayStr(): string {
+  return new Date().toISOString().split("T")[0];
+}
+
+describe("consolidation usage signals", () => {
+  let usageDb: DatabaseManager;
+  let usageDir = "";
+
+  beforeEach(async () => {
+    // Top-level describe: reset the shared exec capture and lock dir here too.
+    execCalls = [];
+    process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR = await fs.mkdtemp(
+      path.join(os.tmpdir(), "pi-consolidation-locks-"),
+    );
+    usageDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-usage-signal-consolidation-"));
+    usageDb = new DatabaseManager(usageDir);
+  });
+
+  afterEach(async () => {
+    try { usageDb.close(); } catch { /* already closed by the test */ }
+    try { await fs.rm(usageDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  it("keeps the subprocess prompt byte-identical when the database has no tracking data", async () => {
+    addMemory(usageDb, SIGNAL_ENTRY_NEVER, "memory"); // zero hits → no signals
+    const store = makeUsageStore([SIGNAL_ENTRY_NEVER]);
+
+    const piWithDb = createMockPi();
+    await triggerConsolidation(piWithDb, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true }, null, usageDb);
+    const withDbPrompt = childPrompt(execCalls[0]);
+
+    execCalls = [];
+    const piNoDb = createMockPi();
+    await triggerConsolidation(piNoDb, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true });
+    const noDbPrompt = childPrompt(execCalls[0]);
+
+    assert.strictEqual(withDbPrompt, noDbPrompt, "prompt must be identical with a dataless database attached");
+    assert.ok(!withDbPrompt.includes(SIGNALS_HEADER));
+  });
+
+  it("annotates recalled and never-recalled entries once tracking data exists", async () => {
+    const recalledRow = addMemory(usageDb, SIGNAL_ENTRY_RECALLED, "memory");
+    addMemory(usageDb, SIGNAL_ENTRY_NEVER, "memory");
+    recordSearchHits(usageDb, [recalledRow.id]);
+    const store = makeUsageStore([SIGNAL_ENTRY_RECALLED, SIGNAL_ENTRY_NEVER]);
+
+    const pi = createMockPi();
+    await triggerConsolidation(pi, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true }, null, usageDb);
+
+    const prompt = childPrompt(execCalls[0]);
+    assert.ok(prompt.includes(SIGNALS_HEADER), "usage signals header present");
+    assert.ok(prompt.includes(`recalled 1x, last ${todayStr()}: "${SIGNAL_ENTRY_RECALLED}"`), "recalled entry annotated with count + date");
+    assert.ok(prompt.includes(`never recalled: "${SIGNAL_ENTRY_NEVER}"`), "never-recalled entry annotated");
+    assert.ok(prompt.includes(SIGNALS_GUIDANCE), "tie-breaker guidance present");
+    // The real entry list stays untouched (child copies entry text from there).
+    assert.ok(prompt.includes(`--- Current Memory Entries ---\n${SIGNAL_ENTRY_RECALLED}\n§\n${SIGNAL_ENTRY_NEVER}\n\n${SIGNALS_HEADER}`));
+  });
+
+  it("omits the section when consolidationUsageSignals is off even with data", async () => {
+    const recalledRow = addMemory(usageDb, SIGNAL_ENTRY_RECALLED, "memory");
+    recordSearchHits(usageDb, [recalledRow.id]);
+    const store = makeUsageStore([SIGNAL_ENTRY_RECALLED]);
+
+    const pi = createMockPi();
+    await triggerConsolidation(pi, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true, consolidationUsageSignals: false }, null, usageDb);
+
+    const prompt = childPrompt(execCalls[0]);
+    assert.ok(!prompt.includes(SIGNALS_HEADER), "kill-switch must suppress the section");
+  });
+
+  it("annotates only the presented batch in chunked rounds", async () => {
+    const entries: string[] = [];
+    for (let i = 0; i < 12; i++) {
+      entries.push(`usage chunk entry ${String(i).padStart(2, "0")} — ${"filler prose for sizing ".repeat(3)}end-${i}`);
+    }
+    const store = makeUsageStore(entries);
+    const rows = entries.map((entry) => addMemory(usageDb, entry, "memory"));
+    recordSearchHits(usageDb, [rows[10].id]); // only a TAIL entry has usage data
+
+    const pi = createMockPi();
+    await triggerConsolidation(pi, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", {
+      consolidationChunking: true,
+      consolidationChunkChars: 500,
+    }, null, usageDb);
+
+    assert.ok(execCalls.length >= 3, `expected multiple rounds, got ${execCalls.length}`);
+    const firstPrompt = childPrompt(execCalls[0]);
+    assert.ok(!firstPrompt.includes(SIGNALS_HEADER), "a batch with no tracked entries gets no section");
+    const annotatedAt = execCalls.findIndex((_, i) => childPrompt(execCalls[i]).includes("recalled 1x"));
+    assert.ok(annotatedAt > 0, "the round containing the tracked entry carries the section");
+    const annotatedPrompt = childPrompt(execCalls[annotatedAt]);
+    assert.ok(annotatedPrompt.includes(`recalled 1x, last ${todayStr()}: "${entries[10].slice(0, 77)}...`), "tail entry annotated when it reaches a batch");
+  });
+
+  it("embeds the same section in the direct-transport userPrompt", async () => {
+    const recalledRow = addMemory(usageDb, SIGNAL_ENTRY_RECALLED, "memory");
+    recordSearchHits(usageDb, [recalledRow.id]);
+    const store = makeUsageStore([SIGNAL_ENTRY_RECALLED]);
+
+    directCalls = [];
+    const pi = createMockPi();
+    const deps = makeDirectDeps({ ok: true, appliedCount: 1 });
+    const result = await triggerConsolidation(
+      pi, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory",
+      directTransportLlmConfig, createDirectCtx() as any, usageDb, null, deps,
+    );
+
+    assert.strictEqual(result.consolidated, true);
+    assert.strictEqual(directCalls.length, 1, "direct transport used, no subprocess needed");
+    const options = (directCalls[0][3] ?? directCalls[0][directCalls[0].length - 1]) as { userPrompt: string };
+    assert.ok(options.userPrompt.includes(SIGNALS_HEADER), "direct prompt carries the section");
+    assert.ok(options.userPrompt.includes(`recalled 1x, last ${todayStr()}: "${SIGNAL_ENTRY_RECALLED}"`));
+  });
+});
+
+describe("consolidation usage signals — large all-recalled store (review blocker)", () => {
+  let usageDb: DatabaseManager;
+  let usageDir = "";
+
+  beforeEach(async () => {
+    execCalls = [];
+    process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR = await fs.mkdtemp(
+      path.join(os.tmpdir(), "pi-consolidation-locks-"),
+    );
+    usageDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-usage-signal-cap-"));
+    usageDb = new DatabaseManager(usageDir);
+  });
+
+  afterEach(async () => {
+    try { usageDb.close(); } catch { /* already closed by the test */ }
+    try { await fs.rm(usageDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  it("caps the tracked half, ranks by hits, and folds the remainder into a summary line", async () => {
+    // 40 entries, EVERY one recalled (the mature-store shape where an uncapped
+    // tracked half would grow with the store). Each entry ~120 chars so the
+    // whole store fits one decisive prompt (chunking off via huge budget).
+    const entries: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      entries.push(`mature-store entry ${String(i).padStart(2, "0")} — ${"recalled prose for sizing ".repeat(3)}end-${i}`);
+    }
+    const store = makeUsageStore(entries);
+    const rows = entries.map((entry) => addMemory(usageDb, entry, "memory"));
+    for (const row of rows) {
+      const hits = 1 + (rows.indexOf(row) % 5); // 1..5 hits, entry 39 has 5
+      for (let i = 0; i < hits; i++) recordSearchHits(usageDb, [row.id]);
+    }
+    // Highest count is on the LAST store entry — sorting must still surface it.
+    for (let i = 0; i < 95; i++) recordSearchHits(usageDb, [rows[39].id]);
+
+    const pi = createMockPi();
+    // One decisive whole-store round: all 40 tracked entries in ONE prompt —
+    // the mature-store shape upstream measured at 270% of the chunk budget.
+    await triggerConsolidation(pi, store, "memory", undefined, DEFAULT_CONSOLIDATION_TIMEOUT_MS, "memory", { consolidationChunking: true, consolidationChunkChars: 999999 }, null, usageDb);
+
+    const prompt = childPrompt(execCalls[0]);
+    const sectionStart = prompt.indexOf("--- Usage Signals (memory_search recall tracking) ---");
+    assert.ok(sectionStart > 0, "signals section present");
+    const section = prompt.slice(sectionStart, prompt.indexOf("Use the memory tool to consolidate", sectionStart));
+
+    const trackedLines = section.split("\n").filter((l) => l.startsWith("- recalled "));
+    assert.strictEqual(trackedLines.length, 20, `tracked half capped at 20 (got ${trackedLines.length})`);
+    assert.match(section, /\(\+20 more recalled entries omitted — showing the top 20 by recall count\)/, "remainder folded into a summary line");
+    // Ranked by hits: the 100-hit entry must top the kept half despite being
+    // LAST in store order, and the kept half is non-increasing by count.
+    assert.match(trackedLines[0], /- recalled 100x, last \d{4}-\d{2}-\d{2}: "mature-store entry 39/);
+    const counts = trackedLines.map((l) => Number(l.match(/- recalled (\d+)x/)![1]));
+    for (let i = 1; i < counts.length; i++) {
+      assert.ok(counts[i] <= counts[i - 1], `kept half must be sorted by hits desc (got ${counts[i - 1]} -> ${counts[i]})`);
+    }
+    // Never-recalled half is empty here — no never-recalled summary expected.
+    assert.ok(!section.includes("have no recorded recalls"));
+    // Bounded section: constant line count, not store-proportional.
+    assert.ok(section.length < 4500, `section bounded (got ${section.length} chars)`);
   });
 });

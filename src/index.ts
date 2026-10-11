@@ -318,6 +318,7 @@ export default function (pi: ExtensionAPI) {
       config,
       undefined,
       dbManager,
+      toolTarget === "project" ? projectName : null,
       );
     };
     const previous = autoConsolidationTail;
