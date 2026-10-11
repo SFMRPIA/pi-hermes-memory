@@ -937,6 +937,12 @@ export class DatabaseManager {
     if (!names.has('corrected_to')) {
       db.exec('ALTER TABLE memories ADD COLUMN corrected_to TEXT');
     }
+    if (!names.has('hit_count')) {
+      db.exec('ALTER TABLE memories ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!names.has('last_hit_at')) {
+      db.exec('ALTER TABLE memories ADD COLUMN last_hit_at DATE');
+    }
   }
 
   private ensureSessionsColumns(db: DatabaseLike): void {
@@ -997,13 +1003,15 @@ export class DatabaseManager {
             tool_state TEXT,
             corrected_to TEXT,
             created DATE NOT NULL,
-            last_referenced DATE NOT NULL
+            last_referenced DATE NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            last_hit_at DATE
           );
         `);
 
         db.exec(`
-          INSERT INTO memories_new (id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced)
-          SELECT id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced
+          INSERT INTO memories_new (id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced, hit_count, last_hit_at)
+          SELECT id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced, hit_count, last_hit_at
           FROM memories;
         `);
 
@@ -1031,13 +1039,15 @@ export class DatabaseManager {
           tool_state TEXT,
           corrected_to TEXT,
           created DATE NOT NULL,
-          last_referenced DATE NOT NULL
+          last_referenced DATE NOT NULL,
+          hit_count INTEGER NOT NULL DEFAULT 0,
+          last_hit_at DATE
         );
       `);
 
       db.exec(`
-          INSERT INTO memories_new (id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced)
-          SELECT id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced
+          INSERT INTO memories_new (id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced, hit_count, last_hit_at)
+          SELECT id, project, target, category, content, failure_reason, tool_state, corrected_to, created, last_referenced, hit_count, last_hit_at
           FROM memories;
         `);
 
