@@ -22,11 +22,14 @@ import { PROMOTION_PROMPT, ENTRY_DELIMITER, DEFAULT_VAULT_PROMOTE_THRESHOLD } fr
 import type { MemoryConfig } from "../types.js";
 import { execChildPrompt } from "./pi-child-process.js";
 import { ensureVault, vaultConfigured, todayStr } from "./vault-notes.js";
+import { registerJob, unregisterJob } from "../store/maintenance-coordinator.js";
 
 export interface PromotionResult {
   promoted: number;
   removed: number;
   error?: string;
+  /** True when the run was refused because memory maintenance (cleanup) is active. */
+  maintenanceDeferred?: boolean;
 }
 
 type Target = "memory" | "user" | "failure";
@@ -145,6 +148,24 @@ function scheduleIfOverThreshold(
  * files, then removes promoted entries from hot memory.
  */
 export async function runVaultPromotion(
+  pi: ExtensionAPI,
+  store: MemoryStore,
+  target: Target,
+  config: MemoryConfig,
+  project = false,
+): Promise<PromotionResult> {
+  // Maintenance job registration: cleanup's drain step waits for this id, and
+  // new promotion runs are refused while maintenance is active.
+  const job = await registerJob("vault-promotion");
+  if (!job.ok) return { promoted: 0, removed: 0, maintenanceDeferred: true };
+  try {
+    return await runVaultPromotionInner(pi, store, target, config, project);
+  } finally {
+    await unregisterJob(job.id);
+  }
+}
+
+async function runVaultPromotionInner(
   pi: ExtensionAPI,
   store: MemoryStore,
   target: Target,

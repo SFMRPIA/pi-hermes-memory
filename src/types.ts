@@ -139,6 +139,8 @@ export interface MemoryResult {
   message?: string;
   warning?: string;
   warnings?: string[];
+  /** True when the mutation was refused because memory maintenance (cleanup) is active — distinct from a normal failure. */
+  maintenanceDeferred?: boolean;
   target?: "memory" | "user" | "failure" | "project";
   entries?: string[];
   usage?: string;
@@ -156,6 +158,8 @@ export interface MemorySnapshot {
 export interface ConsolidationResult {
   /** Whether consolidation succeeded */
   consolidated: boolean;
+  /** True when the run was refused because memory maintenance (cleanup) is active. */
+  maintenanceDeferred?: boolean;
   /** Error message if consolidation failed */
   error?: string;
   /**

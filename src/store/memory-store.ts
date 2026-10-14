@@ -16,6 +16,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scanContent } from "./content-scanner.js";
 import { normalizeMemoryLookupText } from "./memory-lookup.js";
+import { isWriteAdmitted, registerJob, unregisterJob, MAINTENANCE_DEFERRED_MESSAGE } from "./maintenance-coordinator.js";
 import {
   ENTRY_DELIMITER,
   DEFAULT_MEMORY_CHAR_LIMIT,
@@ -29,6 +30,7 @@ import {
 import type { MemoryConfig, MemoryResult, MemorySnapshot, ConsolidationResult, MemoryCategory, MemoryOverflowStrategy } from "../types.js";
 import { AGENT_ROOT } from "../paths.js";
 import { canonicalMarkdownIdentity, withMarkdownMutationLock } from "./markdown-mutation-lock.js";
+import { registerSealAcquirer } from "./maintenance-coordinator.js";
 
 const MAX_EXTERNAL_WRITE_RETRIES = 2;
 const RECOVERY_ACTIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -72,6 +74,17 @@ async function tryRenameOrCopy(src: string, dest: string): Promise<void> {
 
 class ExternalMemoryWriteConflict extends Error {}
 
+/** Decoded, hash-tagged entry snapshot for cleanup planning (read-only). */
+export interface StoreInventoryEntry {
+  index: number;
+  raw: string;
+  text: string;
+  created: string;
+  lastReferenced: string;
+  project: string | null;
+  hash: string;
+}
+
 export class MemoryStore {
   private memoryEntries: string[] = [];
   private userEntries: string[] = [];
@@ -91,7 +104,23 @@ export class MemoryStore {
   private lastConsolidationAttemptAt = new Map<"memory" | "user" | "failure", number>();
   private mutationObserver: ((target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>) | null = null;
 
-  constructor(private config: MemoryConfig) {}
+  constructor(private config: MemoryConfig) {
+    // Seal hook for beginMaintenance(): acquires all three per-target mutation
+    // locks nested (fixed order memory→user→failure) so the maintenance marker
+    // is published under them — closing the check-then-write race with
+    // runTargetMutation's isWriteAdmitted() check. Failures propagate: if the
+    // seal cannot be taken, beginMaintenance fails and no marker is written.
+    registerSealAcquirer(async () => {
+      const memoryPath = await this.resolveStoragePath("memory");
+      await withMarkdownMutationLock(memoryPath, async () => {
+        const userPath = await this.resolveStoragePath("user");
+        await withMarkdownMutationLock(userPath, async () => {
+          const failurePath = await this.resolveStoragePath("failure");
+          await withMarkdownMutationLock(failurePath, () => Promise.resolve());
+        });
+      });
+    });
+  }
 
   /**
    * Inject a consolidation function (avoids circular imports).
@@ -271,6 +300,37 @@ export class MemoryStore {
       return { success: true };
     });
     return squeezed;
+  }
+
+  /**
+   * Read-only inventory of decoded entries for cleanup planning (Task 4).
+   * NO mutation, NO maintenance gating (reads stay available during
+   * maintenance by design). Each entry carries its position, decoded fields
+   * and a sha256 content hash that later apply steps re-verify against
+   * before touching anything (staleness guard).
+   */
+  async readInventory(target: "memory" | "user" | "failure"): Promise<StoreInventoryEntry[]> {
+    await this.syncTargetFromDiskIfChanged(target);
+    return this.entriesFor(target).map((raw, index) => {
+      const decoded = this.decodeEntry(raw);
+      return {
+        index,
+        raw,
+        text: decoded.text,
+        created: decoded.created,
+        lastReferenced: decoded.lastReferenced,
+        project: decoded.project,
+        hash: createHash("sha256").update(raw).digest("hex"),
+      };
+    });
+  }
+
+  /** Deterministic fingerprint of a store's current raw contents. */
+  async storeFingerprint(target: "memory" | "user" | "failure"): Promise<string> {
+    await this.syncTargetFromDiskIfChanged(target);
+    return createHash("sha256")
+      .update(this.entriesFor(target).join(ENTRY_DELIMITER))
+      .digest("hex");
   }
 
   private async squeezeUnlocked(target: "memory" | "user" | "failure"): Promise<number> {
@@ -883,6 +943,13 @@ export class MemoryStore {
   ): Promise<MemoryResult> {
     const storagePath = await this.resolveStoragePath(target);
     return withMarkdownMutationLock(storagePath, async () => {
+      // Hard write gate: while cleanup maintenance holds the store, ordinary
+      // mutations are refused (not queued). Checked inside the mutation lock so
+      // a beginMaintenance() that starts after this check still seals us out —
+      // beginMaintenance takes the same per-target markdown lock first.
+      if (!(await isWriteAdmitted()).admitted) {
+        return { success: false, error: MAINTENANCE_DEFERRED_MESSAGE, maintenanceDeferred: true } as MemoryResult;
+      }
       for (let attempt = 0; ; attempt++) {
         try {
           const result = await mutation();

@@ -40,6 +40,7 @@ import { AGENT_ROOT } from "../paths.js";
 import { appendConsolidationLog } from "./consolidation-log.js";
 import { execChildPrompt } from "./pi-child-process.js";
 import { runDirectMemoryCompletion, usesDirectTransport } from "./review-memory-ops.js";
+import { registerJob, unregisterJob, MAINTENANCE_DEFERRED_MESSAGE } from "../store/maintenance-coordinator.js";
 import { AtomicLockCoordinator } from "../store/atomic-lock-coordinator.js";
 import { syncMarkdownMemoriesToSqlite } from "./sync-markdown-memories.js";
 
@@ -303,6 +304,33 @@ export function takeChunk(entries: string[], chunkChars: number): string[] {
  * snapshots are the repair backstop.
  */
 export async function triggerConsolidation(
+  pi: ExtensionAPI,
+  store: MemoryStore,
+  target: MemoryTarget,
+  signal?: AbortSignal,
+  timeoutMs: number = DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  toolTarget: ToolMemoryTarget = target,
+  llmConfig: ConsolidationLlmConfig = {},
+  directCtx: Pick<ExtensionContext, "model" | "modelRegistry"> | null = null,
+  dbManager: DatabaseManager | null = null,
+  projectName?: string | null,
+  deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion } = {},
+): Promise<ConsolidationResult> {
+  // Maintenance job registration: cleanup's drain step waits for this id, and
+  // new consolidation runs are refused while maintenance is active.
+  const job = await registerJob("consolidation");
+  if (!job.ok) {
+    appendConsolidationLog(`[hermes-memory] consolidate skipped — memory maintenance active (${job.reason}) for ${toolTarget}`);
+    return { consolidated: false, rounds: 0, error: MAINTENANCE_DEFERRED_MESSAGE, maintenanceDeferred: true };
+  }
+  try {
+    return await triggerConsolidationInner(pi, store, target, signal, timeoutMs, toolTarget, llmConfig, directCtx, dbManager, projectName, deps);
+  } finally {
+    await unregisterJob(job.id);
+  }
+}
+
+async function triggerConsolidationInner(
   pi: ExtensionAPI,
   store: MemoryStore,
   target: MemoryTarget,

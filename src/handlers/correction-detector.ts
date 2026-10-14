@@ -261,11 +261,16 @@ export function setupCorrectionDetector(
           const directive = extractCorrectionDirective(correctionText);
           const failureReason = "User corrected the agent";
           const scopedProjectName = projectStore ? projectName?.trim() || null : null;
-          await store.addFailure(directive, {
+          const result = await store.addFailure(directive, {
             category: "correction",
             failureReason,
             project: scopedProjectName ?? undefined,
           });
+          if (result.maintenanceDeferred) {
+            // Do not treat the correction as handled — surface the deferral so
+            // it can be reconsidered after /memory-cleanup finishes.
+            console.warn(`[hermes-memory] correction deferred — memory maintenance active: ${directive.slice(0, 80)}`);
+          }
         }
       } catch {
         // Best-effort — don't block the session

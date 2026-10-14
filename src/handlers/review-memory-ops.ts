@@ -8,6 +8,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "../store/memory-store.js";
 import type { DatabaseManager } from "../store/db.js";
 import type { MemoryCategory, MemoryConfig, MemoryResult, ThinkingLevel } from "../types.js";
+import { registerJob, unregisterJob } from "../store/maintenance-coordinator.js";
 
 export interface ReviewMemoryOperation {
   action: "add" | "replace" | "remove";
@@ -26,7 +27,7 @@ export interface ApplyReviewOperationsResult {
 export interface DirectReviewResult {
   ok: boolean;
   appliedCount: number;
-  fallbackReason?: "no_model" | "no_auth" | "aborted" | "parse_error" | "provider_error" | "empty" | "empty_response";
+  fallbackReason?: "no_model" | "no_auth" | "aborted" | "parse_error" | "provider_error" | "empty" | "empty_response" | "maintenance";
   error?: string;
 }
 
@@ -616,6 +617,32 @@ function notifyThinkingChannelProvider(
 }
 
 export async function runDirectMemoryCompletion(
+  ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
+  store: MemoryStore,
+  projectStore: MemoryStore | null,
+  options: RunDirectMemoryCompletionOptions,
+  dbManager: DatabaseManager | null = null,
+  projectName?: string | null,
+  deps: {
+    completeSimple?: typeof completeSimple;
+    /** Test seam: replaces the console.warn sink for the provider notice. */
+    onProviderNotice?: (message: string) => void;
+    /** Test seam: dedupe state for the provider notice; omit for the process default. */
+    providerNoticeState?: { logged: boolean };
+  } = {},
+): Promise<DirectReviewResult> {
+  // Maintenance job registration: cleanup's drain step waits for this id, and
+  // new review/flush runs are refused while maintenance is active.
+  const job = await registerJob("memory-review");
+  if (!job.ok) return { ok: false, appliedCount: 0, fallbackReason: "maintenance" };
+  try {
+    return await runDirectMemoryCompletionInner(ctx, store, projectStore, options, dbManager, projectName, deps);
+  } finally {
+    await unregisterJob(job.id);
+  }
+}
+
+async function runDirectMemoryCompletionInner(
   ctx: Pick<ExtensionContext, "model" | "modelRegistry">,
   store: MemoryStore,
   projectStore: MemoryStore | null,

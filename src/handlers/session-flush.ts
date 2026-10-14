@@ -16,6 +16,7 @@ import type { MemoryConfig } from "../types.js";
 import { collectMessageParts } from "./message-parts.js";
 import { execChildPrompt } from "./pi-child-process.js";
 import { runDirectMemoryCompletion, readSessionId, usesDirectTransport } from "./review-memory-ops.js";
+import { isWriteAdmitted } from "../store/maintenance-coordinator.js";
 
 function buildDirectFlushUserPrompt(
   store: MemoryStore,
@@ -98,9 +99,22 @@ export function setupSessionFlush(
           projectName,
         );
         if (directResult.ok) return;
+        if (directResult.fallbackReason === "maintenance") {
+          // Maintenance active: do not fall through to the subprocess — its
+          // writes would be deferred anyway. Record the deferral and stop.
+          console.warn("[hermes-memory] session flush deferred — memory maintenance active");
+          return;
+        }
       } catch {
         // Fall through to subprocess below.
       }
+    }
+
+    // Subprocess fallback: same maintenance gate (checked late so an active
+    // run that already passed admission still completes untouched).
+    if (!(await isWriteAdmitted()).admitted) {
+      console.warn("[hermes-memory] session flush deferred — memory maintenance active");
+      return;
     }
 
     const flushMessage = [
