@@ -78,7 +78,9 @@ Note: PS gate tests live in `scripts/tests/sync-memory-maintenance-gate.tests.ps
 - Modify: `C:\Users\User\.pi\agent\scripts\sync-memory.ps1`, `C:\Users\User\.pi\agent\scripts\tests\sync-memory-tombstones.tests.ps1`
 - Create: `src/handlers/maintenance-sync.ts`, Test: `tests/handlers/maintenance-sync.test.ts`
 
-**Approach:** PowerShell gate reads `maintenance-state.json` (phase `quiescing`/`cleaning`/`verifying` ⇒ exit 0 with maintenance message, no writes); TypeScript helper records `PiHermesMemorySyncDaily` original state, disables it, waits out a running sync, allows one owner-authorized sync, restores recorded state.
+**Approach:** PowerShell gate reads `maintenance-state.json` (phase `quiescing`/`cleaning`/`verifying` ⇒ exit 0 with maintenance message, no writes); TypeScript helper records `PiHermesMemorySyncDaily` original state, disables it, waits out a running sync, authorizes cleanup sync stages, restores recorded state.
+
+**Task 5 integration refinement (approved 2026-10-14):** owner-authorized sync is staged exactly once in order: `baseline` → `apply` → `verify`. Stage replay protection binds to the stable owner token, not mutable `updatedAt`; PowerShell persists authorization before data writes and preserves the ledger when loading/saving sync state.
 
 **Guard clauses:** task missing ⇒ record `syncTaskKnown:false`; task uninspectable ⇒ abort pre-mutation; manual sync during maintenance ⇒ no-write exit; Drive missing ⇒ abort or recovery-required; >50%/empty-file safeguards unchanged; restore failure ⇒ report + recovery info.
 
@@ -99,15 +101,23 @@ Note: PS gate tests live in `scripts/tests/sync-memory-maintenance-gate.tests.ps
 ### Task 5 — Apply cleanup with backups and verification
 
 **Files:**
+- Modify: `src/store/memory-store.ts`, `src/handlers/maintenance-sync.ts`, `tests/store/memory-store.test.ts`, `tests/handlers/maintenance-sync.test.ts`
+- Modify external: `C:\Users\User\.pi\agent\scripts\sync-memory.ps1`, `C:\Users\User\.pi\agent\scripts\tests\sync-memory-maintenance-gate.tests.ps1`
 - Create: `src/handlers/memory-cleanup.ts`, Test: `tests/handlers/memory-cleanup.test.ts`
 
-**Approach:** begin maintenance → drain → baseline union sync (no cleanup) → inventory fingerprint → hash-verified backups → journal → apply validated actions (replacement first, then retire originals) → reconcile SQLite scopes → owner-authorized sync → second verification sync → restore original state only on success.
+**Approach:** begin maintenance → drain → baseline union sync (`baseline`, no cleanup) → inventory fingerprints → hash-verified backups → journal → apply all actions per store in one owner-authorized mutation under its lock, verifying the expected store fingerprint and every planned index+SHA-256 reference before any write → reconcile SQLite scopes → authorized `apply` sync → authorized `verify` sync → restore original state only on success. Preserve the keeper's metadata; never route cleanup through substring-based replace/remove.
 
-**Guard clauses:** missing baseline ⇒ establish without historical deletion inference then re-inventory; backup hash mismatch ⇒ stop; inventory changed ⇒ stale-action rejection + re-plan; ambiguous removal ⇒ stop; index reconciliation failure ⇒ recovery-required; replica mismatch post-sync ⇒ stay paused; partial application ⇒ journal+backups preserved, no blind backup-overwrite; over-cap store post-cleanup ⇒ report that consolidation may re-run.
+The sync gate accepts only one ordered `baseline` → `apply` → `verify` stage per stable owner token. It records the stage before sync data writes; marker `updatedAt` changes do not reset authorization, and loading state preserves previously consumed stages.
 
-**Verification:** end-to-end sandbox: no-op, merge, supersede, stale inventory, partial failure, index repair, resurrection prevention, crash recovery.
+**Guard clauses:** missing baseline ⇒ establish without historical deletion inference, then re-inventory; another-machine safety not confirmed or writers fail to drain ⇒ abort before cleanup; backup hash mismatch ⇒ stop; inventory fingerprint mismatch, missing/mismatched entry reference, overlapping action, or invalid replacement ⇒ reject the entire affected store batch without writing; missing/wrong owner token, replayed/out-of-order stage, or corrupt authorization ledger ⇒ fail closed; index reconciliation failure ⇒ recovery-required; replica mismatch post-sync ⇒ stay paused; partial application ⇒ preserve journal+backups and inspect before resuming, never blindly overwrite newer data from backup; over-cap store post-cleanup ⇒ report that consolidation may re-run.
+
+**Verification:** end-to-end sandbox: no-op, merge, supersede, stale fingerprint/hash, duplicate/overlapping refs, unauthorized owner, ordered sync stages and replay refusal despite marker updates, partial failure, index repair, resurrection prevention, crash recovery.
+
+**Status: DONE (2026-10-14).** `runMemoryCleanup` in `src/handlers/memory-cleanup.ts`; 13 handler tests green (tests/handlers/memory-cleanup.test.ts); full targeted suites 120/120, `npm run check` clean. Runner order refined: scheduler disabled before job drain so a drain abort can restore it. Fixture note: `loadFromDisk()` Set-dedupes byte-identical raw entries, so seeded exact duplicates vary metadata dates with identical decoded text.
 
 ### Task 6 — Command surface and skill update
+
+**Status: DONE (2026-10-14).** 24/24 command tests; `npm run check` clean; 144 pass / 4 pre-existing env-skips across the five targeted suites; wired into `src/index.ts` (deps = live stores, `capacityGoal()` caps, full-sweep reconcile, per-store backup sources). Implementation notes: cleared markers are tombstones (`state === null`), so status/recover treat corrupt before idle; project backup source uses `project.memoryDir` (store's `memoryDir` is private).
 
 **Files:**
 - Create: `src/handlers/memory-cleanup-command.ts`, Test: `tests/handlers/memory-cleanup-command.test.ts`

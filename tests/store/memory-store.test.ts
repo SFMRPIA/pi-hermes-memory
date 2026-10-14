@@ -14,6 +14,7 @@ import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 
 
 import { MemoryStore } from "../../src/store/memory-store.js";
+import { maintenanceStatePath } from "../../src/store/maintenance-coordinator.js";
 import {
   ENTRY_DELIMITER,
   DEFAULT_MEMORY_CHAR_LIMIT,
@@ -1787,6 +1788,205 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.deepEqual((store as any).memoryEntries, diskEntries);
     });
 
+  });
+});
+
+describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
+  async function makeFixture(initialTexts: string[]) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-cleanup-apply-"));
+    const memoryDir = root;
+    const maintenanceDir = path.join(root, "maintenance");
+    const previousMaintenanceDir = process.env.PI_HERMES_MAINTENANCE_STATE_DIR;
+    process.env.PI_HERMES_MAINTENANCE_STATE_DIR = maintenanceDir;
+    try {
+      const store = new MemoryStore(makeConfig({ memoryDir }));
+      await store.loadFromDisk();
+      for (const text of initialTexts) {
+        const result = await store.add("memory", text);
+        assert.equal(result.success, true);
+      }
+      const inventory = await store.readInventory("memory");
+      const fingerprint = await store.storeFingerprint("memory");
+      return {
+        root,
+        memoryDir,
+        store,
+        inventory,
+        fingerprint,
+        async begin(ownerToken: string) {
+          await fs.mkdir(maintenanceDir, { recursive: true });
+          const now = new Date().toISOString();
+          await fs.writeFile(maintenanceStatePath(), JSON.stringify({
+            version: 1,
+            maintenance: {
+              version: 1,
+              phase: "cleaning",
+              owner: { pid: process.pid, token: ownerToken, startedAt: now },
+              scopes: ["memory"],
+              originalState: null,
+              backupDir: null,
+              progress: null,
+              recoveryReason: null,
+              updatedAt: now,
+            },
+            jobs: [],
+          }), "utf-8");
+        },
+        async dispose() {
+          if (previousMaintenanceDir === undefined) delete process.env.PI_HERMES_MAINTENANCE_STATE_DIR;
+          else process.env.PI_HERMES_MAINTENANCE_STATE_DIR = previousMaintenanceDir;
+          await fs.rm(root, { recursive: true, force: true });
+        },
+      };
+    } catch (error) {
+      if (previousMaintenanceDir === undefined) delete process.env.PI_HERMES_MAINTENANCE_STATE_DIR;
+      else process.env.PI_HERMES_MAINTENANCE_STATE_DIR = previousMaintenanceDir;
+      await fs.rm(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  it("applies an exact batch and preserves keeper metadata", async () => {
+    const fixture = await makeFixture(["First distinct fact.", "Second distinct fact."]);
+    try {
+      const [keep, remove] = fixture.inventory;
+      await fixture.begin("cleanup-owner");
+      const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
+        keep: { index: keep.index, hash: keep.hash },
+        remove: [{ index: remove.index, hash: remove.hash }],
+        replacement: "Merged distinct facts.",
+      }]);
+      assert.equal(result.success, true);
+      const after = await fixture.store.readInventory("memory");
+      assert.deepEqual(after.map((entry) => entry.text), ["Merged distinct facts."]);
+      assert.equal(after[0].created, keep.created);
+      assert.equal(after[0].lastReferenced, keep.lastReferenced);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("rejects a stale fingerprint without overwriting external disk content", async () => {
+    const fixture = await makeFixture(["First fact.", "Second fact."]);
+    try {
+      const [keep, remove] = fixture.inventory;
+      const memoryPath = path.join(fixture.memoryDir, MEMORY_FILE);
+      await fs.appendFile(memoryPath, ENTRY_DELIMITER + failureEntry("External fact."));
+      const diskBefore = await readRaw(memoryPath);
+      await fixture.begin("cleanup-owner");
+      const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
+        keep: { index: keep.index, hash: keep.hash },
+        remove: [{ index: remove.index, hash: remove.hash }],
+        replacement: "Merged facts.",
+      }]);
+      assert.equal(result.success, false);
+      assert.equal(await readRaw(memoryPath), diskBefore);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("rejects a wrong maintenance owner without changing the store", async () => {
+    const fixture = await makeFixture(["First fact.", "Second fact."]);
+    try {
+      const [keep, remove] = fixture.inventory;
+      await fixture.begin("actual-owner");
+      const before = await readRaw(path.join(fixture.memoryDir, MEMORY_FILE));
+      const result = await fixture.store.applyCleanupActions("memory", "wrong-owner", fixture.fingerprint, [{
+        keep: { index: keep.index, hash: keep.hash },
+        remove: [{ index: remove.index, hash: remove.hash }],
+        replacement: "Merged facts.",
+      }]);
+      assert.equal(result.success, false);
+      assert.equal(result.maintenanceDeferred, true);
+      assert.equal(await readRaw(path.join(fixture.memoryDir, MEMORY_FILE)), before);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("rejects a stale entry hash without partially applying the batch", async () => {
+    const fixture = await makeFixture(["First fact.", "Second fact.", "Third fact."]);
+    try {
+      const [first, second, third] = fixture.inventory;
+      await fixture.begin("cleanup-owner");
+      const memoryPath = path.join(fixture.memoryDir, MEMORY_FILE);
+      const before = await readRaw(memoryPath);
+      const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
+        keep: { index: first.index, hash: first.hash },
+        remove: [{ index: second.index, hash: second.hash }],
+        replacement: "Merged first and second.",
+      }, {
+        keep: { index: third.index, hash: third.hash },
+        remove: [{ index: second.index, hash: "0".repeat(64) }],
+        replacement: "Merged second and third.",
+      }]);
+      assert.equal(result.success, false);
+      assert.equal(await readRaw(memoryPath), before);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("rejects overlapping actions without partially applying the batch", async () => {
+    const fixture = await makeFixture(["First fact.", "Second fact.", "Third fact."]);
+    try {
+      const [first, second, third] = fixture.inventory;
+      await fixture.begin("cleanup-owner");
+      const memoryPath = path.join(fixture.memoryDir, MEMORY_FILE);
+      const before = await readRaw(memoryPath);
+      const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
+        keep: { index: first.index, hash: first.hash },
+        remove: [{ index: second.index, hash: second.hash }],
+        replacement: "Merged first and second.",
+      }, {
+        keep: { index: second.index, hash: second.hash },
+        remove: [{ index: third.index, hash: third.hash }],
+        replacement: "Merged second and third.",
+      }]);
+      assert.equal(result.success, false);
+      assert.equal(await readRaw(memoryPath), before);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("rejects empty cleanup replacements without changing the store", async () => {
+    const fixture = await makeFixture(["First fact.", "Second fact."]);
+    try {
+      const [keep, remove] = fixture.inventory;
+      await fixture.begin("cleanup-owner");
+      const memoryPath = path.join(fixture.memoryDir, MEMORY_FILE);
+      const before = await readRaw(memoryPath);
+      const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
+        keep: { index: keep.index, hash: keep.hash },
+        remove: [{ index: remove.index, hash: remove.hash }],
+        replacement: "  ",
+      }]);
+      assert.equal(result.success, false);
+      assert.equal(await readRaw(memoryPath), before);
+    } finally {
+      await fixture.dispose();
+    }
+  });
+
+  it("rejects an out-of-range entry reference without changing the store", async () => {
+    const fixture = await makeFixture(["First fact.", "Second fact."]);
+    try {
+      const [keep, remove] = fixture.inventory;
+      await fixture.begin("cleanup-owner");
+      const memoryPath = path.join(fixture.memoryDir, MEMORY_FILE);
+      const before = await readRaw(memoryPath);
+      const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
+        keep: { index: fixture.inventory.length, hash: keep.hash },
+        remove: [{ index: remove.index, hash: remove.hash }],
+        replacement: "Merged facts.",
+      }]);
+      assert.equal(result.success, false);
+      assert.equal(await readRaw(memoryPath), before);
+    } finally {
+      await fixture.dispose();
+    }
   });
 });
 

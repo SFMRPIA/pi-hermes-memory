@@ -211,10 +211,10 @@ describe("maintenance-sync isSyncRunning / waitForSyncIdle", () => {
 });
 
 describe("maintenance-sync runAuthorizedSync", () => {
-  it("invokes the script with the owner token", async () => {
+  it("invokes the script with the owner token and authorized stage", async () => {
     const h = makeHarness(() => ({ code: 0, stdout: "[sync-memory] owner-authorized sync\n", stderr: "" }));
     const ms = createMaintenanceSync(h);
-    const result = await ms.runAuthorizedSync("tok-owner-1");
+    const result = await ms.runAuthorizedSync("tok-owner-1", "baseline");
     assert.equal(result.ok, true);
     assert.equal(result.exitCode, 0);
     const args = h.calls[0];
@@ -222,6 +222,8 @@ describe("maintenance-sync runAuthorizedSync", () => {
     assert.ok(args.includes("C:\\fake\\sync-memory.ps1"));
     const tokenIdx = args.indexOf("-AuthorizedOwnerToken");
     assert.equal(args[tokenIdx + 1], "tok-owner-1");
+    const stageIdx = args.indexOf("-AuthorizedSyncStage");
+    assert.equal(args[stageIdx + 1], "baseline");
   });
 
   it("surfaces a blocked (exit 4) run without throwing", async () => {
@@ -231,7 +233,7 @@ describe("maintenance-sync runAuthorizedSync", () => {
       stderr: "",
     }));
     const ms = createMaintenanceSync(h);
-    const result = await ms.runAuthorizedSync("wrong-token");
+    const result = await ms.runAuthorizedSync("wrong-token", "baseline");
     assert.equal(result.ok, false);
     assert.equal(result.exitCode, 4);
     assert.match(result.stdout, /maintenance in progress/);

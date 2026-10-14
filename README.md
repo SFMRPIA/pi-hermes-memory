@@ -33,6 +33,9 @@ pi install npm:pi-hermes-memory
 # Backfill older Markdown memories into SQLite search (optional)
 /memory-sync-markdown
 
+# Deduplicate memory (knowledge-preserving; preview is read-only)
+/memory-cleanup
+
 # Learn how to use it
 /learn-memory-tool
 ```
@@ -400,6 +403,7 @@ This means skills build up naturally over time without you having to ask.
 | `/memory-switch-project` | List all project memories and their entry counts |
 | `/memory-index-sessions` | Import past Pi sessions into the search database |
 | `/memory-sync-markdown` | Backfill Markdown memories into the SQLite search store |
+| `/memory-cleanup` | Preview and apply knowledge-preserving memory dedup (`apply`, `status`, `recover` subcommands) |
 | `/memory-preview-context` | Preview the memory policy or legacy memory blocks appended to the system prompt |
 | `/learn-memory-tool` | Skill that teaches users how to use the memory system |
 

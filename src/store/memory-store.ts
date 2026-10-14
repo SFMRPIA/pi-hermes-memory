@@ -85,6 +85,12 @@ export interface StoreInventoryEntry {
   hash: string;
 }
 
+export interface CleanupActionInput {
+  keep: { index: number; hash: string };
+  remove: Array<{ index: number; hash: string }>;
+  replacement: string;
+}
+
 export class MemoryStore {
   private memoryEntries: string[] = [];
   private userEntries: string[] = [];
@@ -331,6 +337,72 @@ export class MemoryStore {
     return createHash("sha256")
       .update(this.entriesFor(target).join(ENTRY_DELIMITER))
       .digest("hex");
+  }
+
+  /** Apply one store's cleanup plan only if its complete source inventory is unchanged. */
+  async applyCleanupActions(
+    target: "memory" | "user" | "failure",
+    ownerToken: string,
+    expectedFingerprint: string,
+    actions: CleanupActionInput[],
+  ): Promise<MemoryResult> {
+    if (!actions.length) return this.successResponse(target, "No cleanup actions to apply.");
+
+    return this.runTargetMutation(target, async () => {
+      if (!ownerToken.trim()) return { success: false, error: "A maintenance owner token is required." };
+      if (!/^[a-f\d]{64}$/i.test(expectedFingerprint)) {
+        return { success: false, error: "The cleanup inventory fingerprint is invalid." };
+      }
+
+      await this.syncTargetFromDiskIfChanged(target);
+      const entries = this.entriesFor(target);
+      const currentFingerprint = createHash("sha256").update(entries.join(ENTRY_DELIMITER)).digest("hex");
+      if (currentFingerprint !== expectedFingerprint) {
+        return { success: false, error: "Cleanup inventory changed; refresh the plan before applying." };
+      }
+
+      const claimedIndices = new Set<number>();
+      const removedIndices = new Set<number>();
+      const replacements = new Map<number, string>();
+      const invalidPlan = (): MemoryResult => ({ success: false, error: "Cleanup plan is invalid or stale; no changes were applied." });
+      const isReference = (value: unknown): value is { index: number; hash: string } => {
+        if (!value || typeof value !== "object") return false;
+        const ref = value as { index?: unknown; hash?: unknown };
+        return Number.isSafeInteger(ref.index) && (ref.index as number) >= 0
+          && typeof ref.hash === "string" && /^[a-f\d]{64}$/i.test(ref.hash);
+      };
+      const claim = (ref: { index: number; hash: string }): boolean => {
+        if (ref.index >= entries.length || claimedIndices.has(ref.index)) return false;
+        const actualHash = createHash("sha256").update(entries[ref.index]).digest("hex");
+        if (actualHash !== ref.hash) return false;
+        claimedIndices.add(ref.index);
+        return true;
+      };
+
+      for (const action of actions) {
+        if (!action || !isReference(action.keep) || !Array.isArray(action.remove) || action.remove.length === 0
+          || typeof action.replacement !== "string" || !action.replacement.trim()) return invalidPlan();
+        if (!claim(action.keep)) return invalidPlan();
+        const keeper = this.decodeEntry(entries[action.keep.index]);
+        const scanError = scanContent(action.replacement.trim());
+        if (scanError) return { success: false, error: scanError };
+        replacements.set(action.keep.index, this.encodeEntry(
+          action.replacement.trim(), keeper.created, keeper.lastReferenced, keeper.project ?? undefined,
+        ));
+        for (const ref of action.remove) {
+          if (!isReference(ref) || !claim(ref)) return invalidPlan();
+          removedIndices.add(ref.index);
+        }
+      }
+
+      const nextEntries = entries.flatMap((entry, index) => {
+        if (removedIndices.has(index)) return [];
+        return [replacements.get(index) ?? entry];
+      });
+      this.setEntries(target, nextEntries);
+      await this.saveToDisk(target);
+      return this.successResponse(target, "Cleanup actions applied.");
+    }, ownerToken);
   }
 
   private async squeezeUnlocked(target: "memory" | "user" | "failure"): Promise<number> {
@@ -940,6 +1012,7 @@ export class MemoryStore {
   private async runTargetMutation(
     target: "memory" | "user" | "failure",
     mutation: () => Promise<MemoryResult>,
+    ownerToken?: string,
   ): Promise<MemoryResult> {
     const storagePath = await this.resolveStoragePath(target);
     return withMarkdownMutationLock(storagePath, async () => {
@@ -947,7 +1020,7 @@ export class MemoryStore {
       // mutations are refused (not queued). Checked inside the mutation lock so
       // a beginMaintenance() that starts after this check still seals us out —
       // beginMaintenance takes the same per-target markdown lock first.
-      if (!(await isWriteAdmitted()).admitted) {
+      if (!(await isWriteAdmitted(ownerToken)).admitted) {
         return { success: false, error: MAINTENANCE_DEFERRED_MESSAGE, maintenanceDeferred: true } as MemoryResult;
       }
       for (let attempt = 0; ; attempt++) {

@@ -7,12 +7,12 @@
 //   - restoreSyncTask(): restore the RECORDED original state (never assumes
 //     "enabled"), reporting failure so the caller can flag recovery-required
 //   - isSyncRunning() / waitForSyncIdle(): wait for an already-running sync
-//   - runAuthorizedSync(): the single owner-authorized sync permitted by the
-//     sync-memory.ps1 maintenance gate (consumed once per maintenance marker)
+//   - runAuthorizedSync(): one owner-authorized baseline/apply/verify stage
+//     permitted by the sync-memory.ps1 maintenance gate
 //
 // The PowerShell side of this contract lives in sync-memory.ps1
-// (Test-MaintenanceGate + -AuthorizedOwnerToken). All process invocation is
-// injected so tests never touch the real scheduler or spawn PowerShell.
+// (Test-MaintenanceGate + -AuthorizedOwnerToken/-AuthorizedSyncStage). All
+// process invocation is injected so tests never touch the real scheduler or spawn PowerShell.
 import { execFile as execFileCb } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
@@ -25,6 +25,7 @@ const POWERSHELL = "powershell.exe";
 const SYNC_TASK_NAME = "PiHermesMemorySyncDaily";
 
 export type SyncTaskOriginalState = "enabled" | "disabled" | "missing" | "unknown";
+export type AuthorizedSyncStage = "baseline" | "apply" | "verify";
 
 export interface SyncTaskState {
   exists: boolean;
@@ -146,7 +147,7 @@ export function createMaintenanceSync(deps: MaintenanceSyncDeps = {}) {
     }
   }
 
-  async function runAuthorizedSync(ownerToken: string): Promise<AuthorizedSyncResult> {
+  async function runAuthorizedSync(ownerToken: string, stage: AuthorizedSyncStage): Promise<AuthorizedSyncResult> {
     const args = [
       "-NoProfile",
       "-ExecutionPolicy",
@@ -155,6 +156,8 @@ export function createMaintenanceSync(deps: MaintenanceSyncDeps = {}) {
       scriptPath,
       "-AuthorizedOwnerToken",
       ownerToken,
+      "-AuthorizedSyncStage",
+      stage,
     ];
     try {
       const { stdout, stderr } = await run(args);

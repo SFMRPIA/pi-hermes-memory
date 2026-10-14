@@ -55,8 +55,11 @@ import { registerLearnMemoryCommand } from "./handlers/learn-memory.js";
 import { migrateThenSyncMarkdownMemories, registerSyncMarkdownMemoriesCommand } from "./handlers/sync-markdown-memories.js";
 import { registerPreviewContextCommand } from "./handlers/preview-context.js";
 import { registerStandingPinCommand } from "./handlers/standing-pin.js";
+import { registerMemoryCleanupCommand } from "./handlers/memory-cleanup-command.js";
+import type { CleanupRunnerDeps } from "./handlers/memory-cleanup.js";
+import { createMaintenanceSync } from "./handlers/maintenance-sync.js";
 import { StandingInstructions } from "./store/standing-instructions.js";
-import { STANDING_FILE } from "./constants.js";
+import { STANDING_FILE, MEMORY_FILE, USER_FILE } from "./constants.js";
 import { loadConfig } from "./config.js";
 import { detectProject, detectProjectSkills } from "./project.js";
 import { buildPromptContext } from "./prompt-context.js";
@@ -374,6 +377,40 @@ export default function (pi: ExtensionAPI) {
   registerSyncMarkdownMemoriesCommand(pi, dbManager, globalDir, config.projectsMemoryDir, agentRoot);
   registerPreviewContextCommand(pi, store, projectStore, projectName, config, standingStore);
   if (standingStore) registerStandingPinCommand(pi, standingStore);
+
+  // ── /memory-cleanup: preview / apply / status / recover (Task 6 surface
+  // over the Task 5 cleanup runner). Deps are the live stores; the project
+  // store is optional and only included when a project was detected.
+  const cleanupRunnerDeps: CleanupRunnerDeps = {
+    stores: [
+      { label: "memory", store, target: "memory", charLimit: store.capacityGoal("memory") },
+      { label: "user", store, target: "user", charLimit: store.capacityGoal("user") },
+      { label: "failure", store, target: "failure", charLimit: store.capacityGoal("failure") },
+      ...(projectStore
+        ? [{ label: "project" as const, store: projectStore, target: "memory" as const, charLimit: projectStore.capacityGoal("memory") }]
+        : []),
+    ],
+    sync: createMaintenanceSync(),
+    // Full sweep over the global files plus every project folder — startup
+    // only reconciles the current project, so this is the repair path (forced).
+    reconcile: () =>
+      migrateThenSyncMarkdownMemories(
+        dbManager,
+        shouldMigrateExtensionRoot ? legacyGlobalDir : null,
+        globalDir,
+        config.projectsMemoryDir,
+        agentRoot,
+      ).then(() => ({ warnings: [] })),
+    backupSources: [
+      { path: path.join(globalDir, MEMORY_FILE), name: "MEMORY.md" },
+      { path: path.join(globalDir, USER_FILE), name: "USER.md" },
+      { path: path.join(globalDir, "failures.md"), name: "failures.md" },
+      ...(project.memoryDir
+        ? [{ path: path.join(project.memoryDir, MEMORY_FILE), name: "project-MEMORY.md" }]
+        : []),
+    ],
+  };
+  registerMemoryCleanupCommand(pi, { buildRunnerDeps: () => cleanupRunnerDeps });
 
   // ── 10. Live session indexing ──
   pi.on("message_end", async (_event, ctx) => {
