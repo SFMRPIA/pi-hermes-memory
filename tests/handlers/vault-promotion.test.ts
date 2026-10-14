@@ -135,6 +135,31 @@ describe("runVaultPromotion", () => {
     assert.equal(result.promoted, 0);
     assert.match(result.error ?? "", /not configured/);
   });
+
+  it("survives a store.remove lock timeout with partial counts and an error note", async () => {
+    await store.add("memory", "Gamma stable fact about the environment");
+    const gamma = store.getMemoryEntries().find((e) => e.includes("Gamma stable fact"))!;
+    const plan = {
+      promote: [{ file: "System/Assistant/context.md", content: "## Partial Facts\n- gamma fact" }],
+      remove: [gamma, "second entry"],
+    };
+    let removeCalls = 0;
+    const originalRemove = store.remove.bind(store);
+    (store as any).remove = async (target: any, text: string) => {
+      removeCalls++;
+      if (removeCalls >= 2) {
+        throw new Error("Memory mutation already in progress for MEMORY.md");
+      }
+      return originalRemove(target, text);
+    };
+
+    const result = await runVaultPromotion(fakePi(JSON.stringify(plan)), store, "memory", makeConfig({ vaultPath: VAULT }));
+
+    assert.equal(result.promoted, 1, "vault copy already succeeded");
+    assert.equal(result.removed, 1, "first removal succeeded before the lock timeout");
+    assert.match(result.error ?? "", /interrupted/i);
+    assert.match(result.error ?? "", /hot memory/i);
+  });
 });
 
 describe("setupVaultPromotion", () => {
@@ -184,6 +209,43 @@ describe("setupVaultPromotion", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     assert.equal(called, 0, "no promotion below the threshold");
+  });
+
+  it("never rejects into the void when promotion fails (pi crash regression)", async () => {
+    const config = makeConfig({ vaultPath: VAULT, memoryCharLimit: 200 });
+    const store2 = new MemoryStore(config);
+    await store2.loadFromDisk();
+    setupVaultPromotion(
+      {
+        exec: async () => ({
+          code: 0,
+          stdout: JSON.stringify({
+            promote: [{ file: "System/Assistant/context.md", content: "## Crashing Facts\n- fact" }],
+            remove: ["stale entry"],
+          }),
+        }),
+      } as any,
+      store2,
+      null,
+      config,
+    );
+
+    // Simulate the production failure: the per-file mutation lock times out
+    // inside store.remove while promotion is removing promoted entries.
+    (store2 as any).remove = async () => {
+      throw new Error("Memory mutation already in progress for MEMORY.md");
+    };
+
+    const rejections: unknown[] = [];
+    const listener = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", listener);
+    try {
+      await store2.add("memory", "y".repeat(150)); // crosses threshold → schedules promotion
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(rejections.length, 0, "background promotion failure must be caught, not unhandled");
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
   });
 });
 

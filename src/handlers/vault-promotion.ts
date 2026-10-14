@@ -140,7 +140,16 @@ function scheduleIfOverThreshold(
   const key = `${project ? "project:" : ""}${target}`;
   if (pending.has(key)) return;
   pending.add(key);
-  void runVaultPromotion(pi, store, target, config, project).finally(() => pending.delete(key));
+  // Best-effort background work: a promotion failure (e.g. a per-file
+  // mutation lock timeout) must never surface as an unhandled rejection —
+  // that crashes pi via uncaughtException.
+  runVaultPromotion(pi, store, target, config, project)
+    .catch((error) => {
+      console.warn(
+        `[vault-promotion] background promotion failed (entries kept): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    })
+    .finally(() => pending.delete(key));
 }
 
 /**
@@ -263,11 +272,29 @@ async function runVaultPromotionInner(
   }
 
   // Phase 2: remove promoted entries — only after vault writes succeeded.
+  // A failed removal (e.g. per-file mutation lock timeout while another writer
+  // holds MEMORY.md) must NOT reject: copy-then-remove ordering means the
+  // knowledge is already safe in the vault, so we stop removing and report
+  // partial counts. Leftover entries stay in hot memory (duplicate knowledge
+  // at worst, never data loss).
   let removedCount = 0;
+  let removalError: string | null = null;
   for (const text of remove) {
     if (typeof text !== "string" || !text.trim()) continue;
-    const r = await store.remove(target, text.trim());
-    if (r.success) removedCount++;
+    try {
+      const r = await store.remove(target, text.trim());
+      if (r.success) removedCount++;
+    } catch (error) {
+      removalError = error instanceof Error ? error.message : String(error);
+      break;
+    }
+  }
+  if (removalError) {
+    return {
+      promoted: promotedCount,
+      removed: removedCount,
+      error: `Removal interrupted (${removalError}); remaining entries left in hot memory.`,
+    };
   }
 
   return { promoted: promotedCount, removed: removedCount };
