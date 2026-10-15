@@ -57,6 +57,7 @@ import { registerPreviewContextCommand } from "./handlers/preview-context.js";
 import { registerStandingPinCommand } from "./handlers/standing-pin.js";
 import { registerMemoryCleanupCommand } from "./handlers/memory-cleanup-command.js";
 import type { CleanupRunnerDeps } from "./handlers/memory-cleanup.js";
+import { createLunaAnalyzer } from "./handlers/memory-cleanup-eval.js";
 import { createMaintenanceSync } from "./handlers/maintenance-sync.js";
 import { StandingInstructions } from "./store/standing-instructions.js";
 import { STANDING_FILE, MEMORY_FILE, USER_FILE } from "./constants.js";
@@ -391,6 +392,12 @@ export default function (pi: ExtensionAPI) {
         : []),
     ],
     sync: createMaintenanceSync(),
+    // Luna-low analyzer: the command plans exactly like the validated dry run
+    // (strict parsing, deterministic validation, checkpoint cache). Spawn
+    // failures degrade gracefully — groups fall back to needs-review.
+    analyze: createLunaAnalyzer({
+      checkpointPath: path.join(globalDir, ".cleanup-analyzer-checkpoint.jsonl"),
+    }).analyzer,
     // Full sweep over the global files plus every project folder — startup
     // only reconciles the current project, so this is the repair path (forced).
     reconcile: () =>

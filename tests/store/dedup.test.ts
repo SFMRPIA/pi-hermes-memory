@@ -1,7 +1,8 @@
 /**
- * Focused tests for the deterministic near-duplicate dedup:
- *  - add() merges a reworded near-duplicate instead of appending
- *  - dedupeTarget() collapses storm-style duplicates across a store
+ * Focused tests for conservative deduplication:
+ *  - exact repeats are ignored at add time
+ *  - similar entries remain until cleanup can establish redundancy
+ *  - dedupeTarget removes exact repeats but not token-overlap candidates
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -48,15 +49,23 @@ describe("deterministic dedup", () => {
     await fs.rm(DIR, { recursive: true, force: true });
   });
 
-  it("add() merges a reworded near-duplicate instead of appending", async () => {
+  it("add() preserves a near-duplicate candidate instead of choosing by token overlap", async () => {
     const store = new MemoryStore(makeConfig());
-    const a = "Fahmi prefers dedicated per-platform service classes over sharing; every platform gets its own service.";
-    const b = "Fahmi prefers dedicated per-platform service classes — each platform gets its own service class.";
+    const a = "The production build uses 24 workers and enables nightly database replication.";
+    const b = "The production build uses 48 workers and enables nightly database replication.";
     await store.add("memory", a);
     await store.add("memory", b);
-    const entries = store.getMemoryEntries();
-    assert.ok(entries.length === 1, `expected 1 entry after merge, got ${entries.length}`);
-    assert.ok(entries[0].length >= a.length, `kept entry should be >= longer input (${entries[0].length} < ${a.length})`);
+    const entries = await store.readInventory("memory");
+    assert.deepEqual(entries.map((entry) => entry.text), [a, b]);
+  });
+
+  it("add() still ignores an exact repeat", async () => {
+    const store = new MemoryStore(makeConfig());
+    const text = "Fahmi prefers dedicated per-platform service classes.";
+    await store.add("memory", text);
+    await store.add("memory", text);
+    const entries = await store.readInventory("memory");
+    assert.deepEqual(entries.map((entry) => entry.text), [text]);
   });
 
   it("add() still appends genuinely distinct entries", async () => {
@@ -66,18 +75,19 @@ describe("deterministic dedup", () => {
     assert.ok(store.getMemoryEntries().length === 2, "distinct entries must both be kept");
   });
 
-  it("dedupeTarget() collapses near-identical and reworded duplicates", async () => {
+  it("dedupeTarget() removes exact repeats but preserves punctuation-different candidates", async () => {
     const file = path.join(DIR, MEMORY_FILE);
     const t = "2026-08-17";
-    const e1 = "Fahmi never stores ssh keys or hostnames in memory; access is fresh per session." + meta(t);
-    const e2 = "Fahmi never stores ssh keys or hostnames in memory — access is fresh per session." + meta(t);
-    const e3 = "Qwen family runs clean on intel arc a770; gemma freezes the pc." + meta(t);
-    await fs.writeFile(file, [e1, e2, e3].join(ENTRY_DELIMITER));
+    const text = "Fahmi never stores ssh keys or hostnames in memory; access is fresh per session.";
+    const e1 = text + meta(t);
+    const exactRepeat = text + meta("2026-08-18");
+    const candidate = "Fahmi never stores ssh keys or hostnames in memory — access is fresh per session." + meta(t);
+    await fs.writeFile(file, [e1, exactRepeat, candidate].join(ENTRY_DELIMITER));
     const store = new MemoryStore(makeConfig());
     await store.loadFromDisk();
-    assert.ok(store.getMemoryEntries().length === 3, `seeded 3 entries, got ${store.getMemoryEntries().length}`);
     const removed = await store.dedupeTarget("memory");
-    assert.ok(removed === 1, `expected 1 removed, got ${removed}`);
-    assert.ok(store.getMemoryEntries().length === 2, `expected 2 after dedupe, got ${store.getMemoryEntries().length}`);
+    assert.equal(removed, 1, "only the exact same fact text should be removed");
+    const entries = await store.readInventory("memory");
+    assert.deepEqual(entries.map((entry) => entry.text), [text, "Fahmi never stores ssh keys or hostnames in memory — access is fresh per session."]);
   });
 });

@@ -26,7 +26,7 @@ import {
   registerMemoryCleanupCommand,
   parseCleanupArgs,
 } from "../../src/handlers/memory-cleanup-command.js";
-import type { CleanupRunnerDeps, CleanupRunResult } from "../../src/handlers/memory-cleanup.js";
+import type { CleanupRunnerDeps, CleanupRunOptions, CleanupRunResult } from "../../src/handlers/memory-cleanup.js";
 import { ENTRY_DELIMITER, DEFAULT_MEMORY_CHAR_LIMIT, MEMORY_FILE } from "../../src/constants.js";
 import type { MemoryConfig } from "../../src/types.js";
 
@@ -57,6 +57,7 @@ const OK_RESULT: CleanupRunResult = {
   ok: true,
   token: "tok-1",
   appliedActions: 2,
+  passes: 3,
   needsReview: 1,
   overCapStores: [],
   backupDir: path.join(root, "backups", "tok-1"),
@@ -108,16 +109,19 @@ function makePi() {
 }
 
 interface UiHandle {
-  ctx: { ui: { notify: (message: string, severity: string) => void; select: (title: string, items: string[]) => Promise<string | null> } };
+  ctx: { hasUI: boolean; ui: { notify: (message: string, severity: string) => void; select: (title: string, items: string[]) => Promise<string | null>; setStatus: (key: string, text: string | undefined) => void } };
   notifyCalls: { message: string; severity: string }[];
   selectCalls: { title: string; items: string[] }[];
+  statusCalls: { key: string; text: string | undefined }[];
   lastMessage: () => { message: string; severity: string };
 }
 
 function makeCtx(selectAnswers: (string | null)[] = []): UiHandle {
   const notifyCalls: { message: string; severity: string }[] = [];
   const selectCalls: { title: string; items: string[] }[] = [];
+  const statusCalls: { key: string; text: string | undefined }[] = [];
   const ctx = {
+    hasUI: true,
     ui: {
       notify: (message: string, severity: string) => {
         notifyCalls.push({ message, severity });
@@ -126,18 +130,22 @@ function makeCtx(selectAnswers: (string | null)[] = []): UiHandle {
         selectCalls.push({ title, items });
         return selectAnswers.length > 0 ? (selectAnswers.shift() as string | null) : null;
       },
+      setStatus: (key: string, text: string | undefined) => statusCalls.push({ key, text }),
     },
   };
   return {
     ctx,
     notifyCalls,
     selectCalls,
+    statusCalls,
     lastMessage: () => notifyCalls.at(-1)!,
   };
 }
 
 interface SetupOptions {
+  analyze?: CleanupRunnerDeps["analyze"];
   runnerResult?: CleanupRunResult;
+  runCleanup?: (_deps: CleanupRunnerDeps, options: CleanupRunOptions) => Promise<CleanupRunResult>;
   selectAnswers?: (string | null)[];
 }
 
@@ -161,10 +169,11 @@ async function setup(opts: SetupOptions = {}) {
         sync: {} as CleanupRunnerDeps["sync"],
         reconcile: async () => ({ warnings: [] }),
         backupSources: [{ path: memoryPath, name: MEMORY_FILE }],
+        analyze: opts.analyze,
       }) as CleanupRunnerDeps,
     runCleanup: async (_deps, options) => {
       runnerCalls.push({ confirmSingleMachine: options.confirmSingleMachine });
-      return opts.runnerResult ?? OK_RESULT;
+      return opts.runCleanup ? opts.runCleanup(_deps, options) : opts.runnerResult ?? OK_RESULT;
     },
     sync: syncFake,
   });
@@ -239,6 +248,41 @@ describe("preview", () => {
     assert.equal(lastMessage().severity, "info");
   });
 
+  it("shows candidate-check progress in transient status and clears it after preview", async () => {
+    const { command, store, statusCalls, ctx } = await setup({
+      analyze: async () => ({ action: "keep_both" }),
+    });
+    await seedRaw(store, [
+      "Each deployed release creates one reference file from the documentation command.",
+      "For every release that is deployed, the documentation command produces a single reference file.",
+    ]);
+
+    await command.conf.handler("preview", ctx);
+
+    const texts = statusCalls.map((call) => call.text);
+    assert.ok(texts.includes("🧹 Memory cleanup · Checking duplicate groups 0 / 1"));
+    assert.ok(texts.includes("🧹 Memory cleanup · Checking duplicate groups 1 / 1"));
+    assert.equal(texts.at(-1), undefined);
+  });
+
+  it("reports redundant entries and cached versus fresh candidate checks", async () => {
+    const analyze = Object.assign(
+      async () => ({ action: "deduplicate" as const, keepIndex: 1, removeIndices: [0] }),
+      { isCached: async () => true },
+    );
+    const { command, store, ctx, lastMessage } = await setup({ analyze });
+    await seedRaw(store, [
+      "Each deployed release creates one reference file from the documentation command.",
+      "For every release that is deployed, the documentation command produces a single reference file.",
+    ]);
+
+    await command.conf.handler("preview", ctx);
+
+    assert.match(lastMessage().message, /Redundant entries to remove: 1/);
+    assert.match(lastMessage().message, /Candidate groups: 1 \(fresh: 0, cached: 1\)/);
+    assert.match(lastMessage().message, /Outcomes: keep-both 0, safety-rejected 0, failed\/invalid 0, deferred 0/);
+  });
+
   it("reports a store read failure without crashing or writing", async () => {
     const { commands, pi } = makePi();
     const ui = makeCtx();
@@ -294,6 +338,43 @@ describe("apply", () => {
     assert.ok(selectCalls[0]!.items.some((item) => /cancel/i.test(item)));
   });
 
+  it("updates transient status and clears it after success, no-op, and failed results", async () => {
+    const results: CleanupRunResult[] = [
+      OK_RESULT,
+      { ...OK_RESULT, skippedSyncStages: true, appliedActions: 0, backupDir: null },
+      { ok: false, stage: "reconcile", reason: "failed", recoveryRequired: true, backupDir: null },
+    ];
+    for (const result of results) {
+      const { command, statusCalls, ctx } = await setup({
+        selectAnswers: ["Yes — the other machine is off or paused"],
+        runCleanup: async (_deps, options) => {
+          options.onProgress?.("Checking duplicate groups 1 / 2");
+          return result;
+        },
+      });
+      await command.conf.handler("apply", ctx);
+      assert.deepEqual(statusCalls, [
+        { key: "memory-cleanup", text: "🧹 Memory cleanup · Checking duplicate groups 1 / 2" },
+        { key: "memory-cleanup", text: undefined },
+      ]);
+    }
+  });
+
+  it("clears transient status when the runner throws", async () => {
+    const { command, statusCalls, ctx } = await setup({
+      selectAnswers: ["Yes — the other machine is off or paused"],
+      runCleanup: async (_deps, options) => {
+        options.onProgress?.("Starting cleanup");
+        throw new Error("runner exploded");
+      },
+    });
+    await assert.rejects(command.conf.handler("apply", ctx), /runner exploded/);
+    assert.deepEqual(statusCalls, [
+      { key: "memory-cleanup", text: "🧹 Memory cleanup · Starting cleanup" },
+      { key: "memory-cleanup", text: undefined },
+    ]);
+  });
+
   it("summarizes a successful run including backup dir and token", async () => {
     const { command, lastMessage, ctx } = await setup({
       selectAnswers: ["Yes — the other machine is off or paused"],
@@ -304,6 +385,16 @@ describe("apply", () => {
     assert.match(lastMessage().message, /2/);
     assert.match(lastMessage().message, /tok-1/);
     assert.match(lastMessage().message, /backup/i);
+    assert.match(lastMessage().message, /Passes: 3/);
+  });
+
+  it("omits the passes line for a single-pass run", async () => {
+    const { command, lastMessage, ctx } = await setup({
+      selectAnswers: ["Yes — the other machine is off or paused"],
+      runnerResult: { ...OK_RESULT, passes: 1 },
+    });
+    await command.conf.handler("apply", ctx);
+    assert.doesNotMatch(lastMessage().message, /Passes:/);
   });
 
   it("notes the no-op short-circuit when sync stages were skipped", async () => {

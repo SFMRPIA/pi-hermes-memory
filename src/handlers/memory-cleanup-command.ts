@@ -77,6 +77,7 @@ function formatApplyResult(result: CleanupRunResult): string {
   if (result.ok) {
     lines.push("✅ Memory cleanup applied");
     lines.push(`  Actions applied: ${result.appliedActions} · Needs-review (untouched): ${result.needsReview}`);
+    if (result.passes > 1) lines.push(`  Passes: ${result.passes}`);
     if (result.backupDir) lines.push(`  Backups: ${result.backupDir}`);
     lines.push(`  Maintenance token: ${result.token}`);
     if (result.skippedSyncStages) lines.push("  No-op run — nothing to clean; sync stages skipped.");
@@ -103,45 +104,61 @@ async function formatSyncTaskLine(sync: NonNullable<MemoryCleanupCommandDeps["sy
   return `  Scheduled sync task: ${state.enabled ? "enabled" : "disabled"} (${state.rawState})`;
 }
 
-async function runPreview(deps: MemoryCleanupCommandDeps, ui: { notify: (m: string, s: string) => void }): Promise<void> {
+async function runPreview(
+  deps: MemoryCleanupCommandDeps,
+  ui: { notify: (m: string, s: string) => void; progress: (message?: string) => void },
+): Promise<void> {
   const runnerDeps = deps.buildRunnerDeps();
   const failures: string[] = [];
   const inventories: InventoryInput[] = [];
   const fingerprints: string[] = [];
 
-  for (const spec of runnerDeps.stores as CleanupStoreSpec[]) {
-    try {
-      const entries = await spec.store.readInventory(spec.target);
-      const fingerprint = await spec.store.storeFingerprint(spec.target);
-      inventories.push({ store: spec.label, entries, fingerprint });
-      fingerprints.push(`  ${spec.label}: ${fingerprint.slice(0, 12)} (${entries.length} entries)`);
-    } catch (error) {
-      failures.push(`  ❌ ${spec.label}: ${errorText(error)}`);
+  ui.progress("Reading stores");
+  try {
+    for (const [index, spec] of (runnerDeps.stores as CleanupStoreSpec[]).entries()) {
+      ui.progress(`Reading store ${index + 1} / ${runnerDeps.stores.length} (${spec.label})`);
+      try {
+        const entries = await spec.store.readInventory(spec.target);
+        const fingerprint = await spec.store.storeFingerprint(spec.target);
+        inventories.push({ store: spec.label, entries, fingerprint });
+        fingerprints.push(`  ${spec.label}: ${fingerprint.slice(0, 12)} (${entries.length} entries)`);
+      } catch (error) {
+        failures.push(`  ❌ ${spec.label}: ${errorText(error)}`);
+      }
     }
-  }
 
-  const lines: string[] = ["", "  🧹 Memory cleanup preview (read-only)", ""];
-  let plan: Awaited<ReturnType<typeof planCleanup>> | null = null;
-  if (inventories.length > 0) {
-    try {
-      plan = await planCleanup(inventories, { analyze: runnerDeps.analyze ?? null });
-    } catch (error) {
-      failures.push(`  ❌ planner: ${errorText(error)}`);
+    const lines: string[] = ["", "  🧹 Memory cleanup preview (read-only)", ""];
+    let plan: Awaited<ReturnType<typeof planCleanup>> | null = null;
+    if (inventories.length > 0) {
+      try {
+        plan = await planCleanup(inventories, {
+          analyze: runnerDeps.analyze ?? null,
+          onProgress: (completed, total) => ui.progress(`Checking duplicate groups ${completed} / ${total}`),
+        });
+      } catch (error) {
+        failures.push(`  ❌ planner: ${errorText(error)}`);
+      }
     }
-  }
-  if (plan) {
-    const merges = plan.actions.filter((action) => action.type === "merge").length;
-    const supersedes = plan.actions.filter((action) => action.type === "supersede").length;
-    lines.push(`  Planned actions: ${plan.actions.length} (duplicate merges: ${merges} · supersedes: ${supersedes})`);
-    lines.push(`  Needs-review candidates (left untouched): ${plan.needsReview.length}`);
-    if (plan.actions.length === 0 && plan.needsReview.length === 0) {
-      lines.push("  No duplicates or stale candidates found — memory is already clean.");
+    if (plan) {
+      const redundantEntries = plan.actions.reduce((total, action) => total + action.remove.length, 0);
+      lines.push(`  Redundant entries to remove: ${redundantEntries}`);
+      lines.push(`  Exact duplicate groups: ${plan.stats.exactDuplicateGroups}`);
+      lines.push(`  Candidate groups: ${plan.stats.candidateGroups} (fresh: ${plan.stats.freshGroupsAnalyzed}, cached: ${plan.stats.cachedGroups})`);
+      lines.push(`  Candidates left untouched: ${plan.needsReview.length}`);
+      lines.push(
+        `  Outcomes: keep-both ${plan.stats.keepBothGroups}, safety-rejected ${plan.stats.safetyRejectedGroups}, failed/invalid ${plan.stats.analyzerFailedGroups}, deferred ${plan.stats.deferredGroups}`,
+      );
+      if (redundantEntries === 0 && plan.needsReview.length === 0) {
+        lines.push("  No duplicate facts found in this scan.");
+      }
     }
+    if (fingerprints.length > 0) lines.push(...fingerprints);
+    lines.push(...failures);
+    lines.push("  Run /memory-cleanup apply to execute (requires confirmation).", "");
+    ui.notify(lines.join("\n"), "info");
+  } finally {
+    ui.progress();
   }
-  if (fingerprints.length > 0) lines.push(...fingerprints);
-  lines.push(...failures);
-  lines.push("  Run /memory-cleanup apply to execute (requires confirmation).", "");
-  ui.notify(lines.join("\n"), "info");
 }
 
 async function runStatus(deps: MemoryCleanupCommandDeps, ui: { notify: (m: string, s: string) => void }): Promise<void> {
@@ -262,6 +279,14 @@ export function registerMemoryCleanupCommand(pi: ExtensionAPI, deps: MemoryClean
     handler: async (args, ctx) => {
       const ui = {
         notify: (message: string, severity: string) => ctx.ui.notify(message, severity as "info" | "warning" | "error"),
+        progress: (message?: string) => {
+          if (!ctx.hasUI) return;
+          try {
+            ctx.ui.setStatus("memory-cleanup", message ? `🧹 Memory cleanup · ${message}` : undefined);
+          } catch {
+            // Status is best-effort; UI failures must not affect cleanup.
+          }
+        },
       };
       const mode = parseCleanupArgs(args);
 
@@ -292,10 +317,15 @@ export function registerMemoryCleanupCommand(pi: ExtensionAPI, deps: MemoryClean
         ui.notify("\n  🧹 Cleanup aborted — nothing was changed.\n", "info");
         return;
       }
-      const result = await (deps.runCleanup ?? runMemoryCleanup)(deps.buildRunnerDeps(), {
-        confirmSingleMachine: true,
-      });
-      ui.notify(formatApplyResult(result), result.ok ? "info" : "warning");
+      try {
+        const result = await (deps.runCleanup ?? runMemoryCleanup)(deps.buildRunnerDeps(), {
+          confirmSingleMachine: true,
+          onProgress: ui.progress,
+        });
+        ui.notify(formatApplyResult(result), result.ok ? "info" : "warning");
+      } finally {
+        ui.progress();
+      }
     },
   });
 }

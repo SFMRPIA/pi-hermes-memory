@@ -48,8 +48,8 @@ function fakeAnalyzer(decisions: Array<GroupDecision | null | Error>): {
 }
 
 // Lexically-close reworded pair (Jaccard over significant tokens ≈ 0.62).
-const PAIR_A = "Consolidation runs at most once per cooldown window per store.";
-const PAIR_B = "Consolidation runs one time per cooldown window for every store.";
+const PAIR_A = "Each deployed release creates one reference file from the documentation command.";
+const PAIR_B = "For every release that is deployed, the documentation command produces a single reference file.";
 
 describe("planCleanup — no candidates", () => {
   it("returns a no-op plan without calling the analyzer", async () => {
@@ -92,11 +92,26 @@ describe("planCleanup — exact duplicates", () => {
     );
     assert.equal(plan.actions.length, 1);
     const action = plan.actions[0];
-    assert.equal(action.type, "merge");
+    assert.equal(action.type, "deduplicate");
     assert.equal(action.keep.index, 1); // newest lastReferenced
     assert.deepEqual(action.remove.map((r) => r.index), [2, 0]); // recency desc
-    assert.equal(action.replacement, text);
+    assert.equal("replacement" in action, false, "dedup must retain existing text, not generate a rewrite");
     assert.equal(h.calls, 0, "exact dups must not consume analysis budget");
+  });
+
+  it("ignores only embedded bookkeeping timestamps when finding exact duplicate facts", async () => {
+    const fact = "The nightly index job rebuilds every search vector after each release tag.";
+    const older = `${fact} <!-- created=2026-09-01, last=2026-09-03 -->`;
+    const repeated = `${fact} <!-- created=2026-09-02, last=2026-09-04 --> <!-- created=2026-09-02, last=2026-09-04 -->`;
+    const h = fakeAnalyzer([new Error("metadata-only duplicates must not call the analyzer")]);
+    const plan = await planCleanup([inv("memory", [
+      entry(older, { index: 0, lastReferenced: "2026-09-03" }),
+      entry(repeated, { index: 1, lastReferenced: "2026-09-04" }),
+    ])], { analyze: h.analyzer });
+    assert.equal(plan.stats.exactDuplicateGroups, 1);
+    assert.equal(plan.actions.length, 1);
+    assert.equal(plan.actions[0].keep.index, 1);
+    assert.equal(h.calls, 0);
   });
 
   it("never merges identical texts from different project scopes", async () => {
@@ -122,141 +137,123 @@ describe("planCleanup — exact duplicates", () => {
   });
 });
 
-describe("planCleanup — near-duplicate semantic analysis", () => {
-  it("routes same-scope similar entries to the analyzer and applies a validated merge", async () => {
-    const replacement = `${PAIR_A}, one time for every store.`;
-    const h = fakeAnalyzer([{ action: "merge", replacement }]);
+describe("planCleanup — semantic deduplication", () => {
+  it("keeps the selected existing entry verbatim and removes only covered entries", async () => {
+    const h = fakeAnalyzer([{ action: "deduplicate", keepIndex: 1, removeIndices: [0], rationale: "B contains A" }]);
     const plan = await planCleanup(
       [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
       { analyze: h.analyzer },
     );
     assert.equal(h.calls, 1);
     assert.equal(plan.actions.length, 1);
-    assert.equal(plan.actions[0].type, "merge");
-    assert.equal(plan.stats.analyzedGroups, 1);
+    assert.equal(plan.actions[0].type, "deduplicate");
+    assert.equal(plan.actions[0].keep.index, 1);
+    assert.deepEqual(plan.actions[0].remove.map((r) => r.index), [0]);
+    assert.equal("replacement" in plan.actions[0], false);
+    assert.equal(plan.actions[0].keep.hash, entry(PAIR_B, { index: 1 }).hash);
     assert.equal(plan.needsReview.length, 0);
   });
 
-  it("rejects a merge whose replacement drops a hard fact", async () => {
+  it("records keep-both decisions as complete, not unresolved review", async () => {
+    const h = fakeAnalyzer([{ action: "keep_both", rationale: "distinct facts" }]);
+    const plan = await planCleanup(
+      [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
+      { analyze: h.analyzer },
+    );
+    assert.equal(plan.actions.length, 0);
+    assert.equal(plan.needsReview.length, 0);
+    assert.equal(plan.stats.analyzedGroups, 1);
+  });
+
+  it("rejects removal when a hard fact is absent from the keeper", async () => {
     const A = "The upload limit is set to 64 megabytes for php ini on this machine.";
-    const B = "The upload limit for the php ini config on this machine is 64 megabytes.";
-    const h = fakeAnalyzer([
-      { action: "merge", replacement: "The upload limit for the php ini config on this machine is generous." },
-    ]);
+    const B = "The upload limit for the php ini config on this machine is 32 megabytes.";
+    const h = fakeAnalyzer([{ action: "deduplicate", keepIndex: 1, removeIndices: [0] }]);
     const plan = await planCleanup([inv("memory", [entry(A, { index: 0 }), entry(B, { index: 1 })])], {
       analyze: h.analyzer,
     });
     assert.equal(plan.actions.length, 0);
-    assert.equal(plan.needsReview.length, 1);
-    assert.match(plan.needsReview[0].reason, /hard fact "64"/);
+    assert.match(plan.needsReview[0].reason, /hard fact/);
   });
 
-  it("rejects a merge whose replacement loses a member's content", async () => {
-    const h = fakeAnalyzer([{ action: "merge", replacement: PAIR_A }]);
-    const plan = await planCleanup(
-      [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
-      { analyze: h.analyzer },
-    );
-    assert.equal(plan.actions.length, 0);
-    assert.match(plan.needsReview[0].reason, /loses content/);
-  });
-
-  it("rejects a merge introducing unsupported new facts", async () => {
-    const h = fakeAnalyzer([
-      {
-        action: "merge",
-        replacement:
-          "Consolidation runs at most once per cooldown window per store, one time for every store, and the vault compactor rewrites tombstone indexes nightly.",
-      },
-    ]);
-    const plan = await planCleanup(
-      [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
-      { analyze: h.analyzer },
-    );
-    assert.equal(plan.actions.length, 0);
-    assert.match(plan.needsReview[0].reason, /unsupported facts/);
-  });
-
-  it("applies a supersede backed by an explicit correction cue and recency", async () => {
-    const OLD = "Deploy uses npm run build for production output today.";
-    const NEW = "Deploy no longer uses npm run build; vite build is used for production output today.";
-    const h = fakeAnalyzer([{ action: "supersede", keepIndex: 1, rationale: "explicit no-longer correction" }]);
-    const plan = await planCleanup(
-      [
-        inv("memory", [
-          entry(OLD, { index: 0, lastReferenced: "2026-09-01" }),
-          entry(NEW, { index: 1, lastReferenced: "2026-10-10" }),
-        ]),
-      ],
-      { analyze: h.analyzer },
-    );
-    assert.equal(plan.actions.length, 1);
-    const action = plan.actions[0];
-    assert.equal(action.type, "supersede");
-    assert.equal(action.keep.index, 1);
-    assert.deepEqual(action.remove.map((r) => r.index), [0]);
-    assert.equal(action.replacement, NEW);
-  });
-
-  it("downgrades timestamp-only supersession (no cue) to needs-review", async () => {
-    const NEW = `${PAIR_A} as of the new policy today.`;
-    const h = fakeAnalyzer([{ action: "supersede", keepIndex: 1 }]);
-    const plan = await planCleanup(
-      [
-        inv("memory", [
-          entry(PAIR_A, { index: 0, lastReferenced: "2026-09-01" }),
-          entry(NEW, { index: 1, lastReferenced: "2026-10-10" }),
-        ]),
-      ],
-      { analyze: h.analyzer },
-    );
-    assert.equal(plan.actions.length, 0);
-    assert.match(plan.needsReview[0].reason, /not correction evidence/);
-  });
-
-  it("treats a hypothetical upgrade ('might') as a proposal, not supersession", async () => {
-    const OLD = "The memory store backend uses markdown files and the sqlite mirror.";
-    const NEW = "The memory store backend uses markdown files and might upgrade the sqlite mirror someday.";
-    const h = fakeAnalyzer([{ action: "supersede", keepIndex: 1 }]);
-    const plan = await planCleanup([inv("memory", [entry(OLD, { index: 0 }), entry(NEW, { index: 1 })])], {
+  it("rejects removal when negation or conditions differ", async () => {
+    const A = "The service never stores private values during scheduled retries.";
+    const B = "The service always stores private values during scheduled retries.";
+    const h = fakeAnalyzer([{ action: "deduplicate", keepIndex: 1, removeIndices: [0] }]);
+    const plan = await planCleanup([inv("memory", [entry(A, { index: 0 }), entry(B, { index: 1 })])], {
       analyze: h.analyzer,
     });
     assert.equal(plan.actions.length, 0);
-    assert.equal(plan.needsReview.length, 1);
+    assert.match(plan.needsReview[0].reason, /qualifiers differ/);
   });
 
-  it("blocks supersession when the survivor drops a victim hard fact", async () => {
-    const OLD = "The upload limit is set to 64 megabytes for php ini on this machine.";
-    const NEW = "The upload limit was corrected for php ini on this machine — fewer megabytes now.";
-    const h = fakeAnalyzer([{ action: "supersede", keepIndex: 1 }]);
-    const plan = await planCleanup(
-      [
-        inv("memory", [
-          entry(OLD, { index: 0, lastReferenced: "2026-09-01" }),
-          entry(NEW, { index: 1, lastReferenced: "2026-10-10" }),
-        ]),
-      ],
-      { analyze: h.analyzer },
-    );
+  it("does not deduplicate entries that name different projects in their text", async () => {
+    const A = "In project Alpha, category filters may be single-select on all product pages.";
+    const B = "In project Beta, category filters may be single-select on all product pages.";
+    const h = fakeAnalyzer([{ action: "deduplicate", keepIndex: 1, removeIndices: [0] }]);
+    const plan = await planCleanup([inv("memory", [entry(A, { index: 0 }), entry(B, { index: 1 })])], {
+      analyze: h.analyzer,
+    });
     assert.equal(plan.actions.length, 0);
-    assert.match(plan.needsReview[0].reason, /conflicting details/);
+    assert.match(plan.needsReview[0].reason, /qualifiers differ/);
   });
 
-  it("does not let an older entry act as the surviving correction (recency guard)", async () => {
-    const NEWER = "Config uses vite build output now instead of the old pipeline.";
-    const OLDER = "Config was corrected to use the vite build output pipeline instead.";
-    const h = fakeAnalyzer([{ action: "supersede", keepIndex: 1 }]);
-    const plan = await planCleanup(
-      [
-        inv("memory", [
-          entry(NEWER, { index: 0, lastReferenced: "2026-10-10" }),
-          entry(OLDER, { index: 1, lastReferenced: "2026-09-01" }),
-        ]),
-      ],
-      { analyze: h.analyzer },
-    );
+  it("does not auto-delete punctuation-normalized but nonidentical text", async () => {
+    const A = "In project A, category filters may be single-select on all product pages.";
+    const B = "In project A, category filters may be single-select on all product pages!";
+    const h = fakeAnalyzer([{ action: "keep_both" }]);
+    const plan = await planCleanup([inv("memory", [entry(A, { index: 0 }), entry(B, { index: 1 })])], {
+      analyze: h.analyzer,
+    });
+    assert.equal(h.calls, 1);
     assert.equal(plan.actions.length, 0);
-    assert.match(plan.needsReview[0].reason, /older than victim/);
+    assert.equal(plan.needsReview.length, 0);
+  });
+
+  it("rejects invalid, duplicate, or keeper-overlapping member indices", async () => {
+    for (const removeIndices of [[0, 0], [1], [9], []]) {
+      const h = fakeAnalyzer([{ action: "deduplicate", keepIndex: 1, removeIndices }]);
+      const plan = await planCleanup(
+        [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
+        { analyze: h.analyzer },
+      );
+      assert.equal(plan.actions.length, 0, JSON.stringify(removeIndices));
+      assert.equal(plan.needsReview.length, 1);
+    }
+  });
+
+  it("keeps candidate IDs stable when indexes and metadata dates change", async () => {
+    const collect = async (entries: StoreInventoryEntry[]) => {
+      const ids: string[] = [];
+      const analyzer: GroupAnalyzer = async (group) => {
+        ids.push(group.id);
+        return { action: "keep_both" };
+      };
+      await planCleanup([inv("memory", entries)], { analyze: analyzer });
+      return ids;
+    };
+    const first = await collect([entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })]);
+    const second = await collect([
+      entry(PAIR_A, { index: 7, lastReferenced: "2026-10-14" }),
+      entry(PAIR_B, { index: 9, lastReferenced: "2026-10-15" }),
+    ]);
+    assert.deepEqual(second, first);
+  });
+});
+
+describe("planCleanup — progress", () => {
+  it("reports the completed analyzer group count without progress for zero candidates", async () => {
+    const progress: Array<[number, number]> = [];
+    const h = fakeAnalyzer([{ action: "keep_both" }]);
+    await planCleanup(
+      [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
+      { analyze: h.analyzer, onProgress: (completed, total) => progress.push([completed, total]) },
+    );
+    assert.deepEqual(progress, [[0, 1], [1, 1]]);
+
+    const none: Array<[number, number]> = [];
+    await planCleanup([inv("memory", [])], { onProgress: (completed, total) => none.push([completed, total]) });
+    assert.deepEqual(none, []);
   });
 });
 
@@ -281,18 +278,8 @@ describe("planCleanup — analyzer robustness", () => {
     assert.match(plan.needsReview[0].reason, /Unknown action/);
   });
 
-  it("treats an empty replacement as no decision", async () => {
-    const h = fakeAnalyzer([{ action: "merge", replacement: "   " }]);
-    const plan = await planCleanup(
-      [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
-      { analyze: h.analyzer },
-    );
-    assert.equal(plan.actions.length, 0);
-    assert.match(plan.needsReview[0].reason, /empty replacement/);
-  });
-
-  it("rejects a supersede that does not identify a survivor", async () => {
-    const h = fakeAnalyzer([{ action: "supersede", keepIndex: 9 }]);
+  it("rejects deduplication that does not identify a keeper", async () => {
+    const h = fakeAnalyzer([{ action: "deduplicate", keepIndex: 9, removeIndices: [0] }]);
     const plan = await planCleanup(
       [inv("memory", [entry(PAIR_A, { index: 0 }), entry(PAIR_B, { index: 1 })])],
       { analyze: h.analyzer },
@@ -396,7 +383,7 @@ describe("planCleanup — bounds and grouping", () => {
     const plan = await planCleanup([inv("memory", entries)], {
       analyze: async () => {
         calls++;
-        return { action: "merge", replacement: PAIR_A };
+        return { action: "keep_both" };
       },
       maxGroups: 2,
     });
@@ -404,6 +391,38 @@ describe("planCleanup — bounds and grouping", () => {
     assert.equal(plan.stats.candidateGroups, 3);
     const overflow = plan.needsReview.filter((r) => r.reason.includes("budget"));
     assert.equal(overflow.length, 1);
+  });
+
+  it("processes cached groups without spending the fresh-analysis budget", async () => {
+    const pairs: Array<[string, string]> = [
+      ["Deploy workflow runs npm build and ships package after every release tag.", "Every release tag triggers the deploy workflow to build npm and ship the package."],
+      ["Database backup writes a postgres dump nightly to the encrypted bucket.", "The encrypted bucket receives a nightly postgres database backup dump."],
+      ["Index worker rebuilds search vectors weekly under the maintenance lease.", "Weekly search vectors are rebuilt by the index worker under the maintenance lease."],
+    ];
+    const cachedIds = new Set<string>();
+    let freshCalls = 0;
+    const analyzer: GroupAnalyzer = async (group) => {
+      if (!cachedIds.has(group.id)) freshCalls++;
+      return { action: "keep_both" };
+    };
+    analyzer.isCached = async (group) => cachedIds.has(group.id);
+    analyzer.recordValidatedDecision = async (group) => { cachedIds.add(group.id); };
+    const makeEntries = (groupIndexes: number[], start: number) => groupIndexes.flatMap((groupIndex, i) => {
+      const [a, b] = pairs[groupIndex];
+      return [
+        entry(a, { index: start + i * 2, lastReferenced: "2026-10-01" }),
+        entry(b, { index: start + i * 2 + 1, lastReferenced: "2026-10-01" }),
+      ];
+    });
+
+    const first = await planCleanup([inv("memory", makeEntries([0, 1], 0))], { analyze: analyzer, maxGroups: 2 });
+    assert.equal(first.stats.freshGroupsAnalyzed, 2);
+    const refreshedEntries = makeEntries([0, 1], 20).reverse().concat(makeEntries([2], 30));
+    const second = await planCleanup([inv("memory", refreshedEntries)], { analyze: analyzer, maxGroups: 1 });
+    assert.equal(second.stats.cachedGroups, 2);
+    assert.equal(second.stats.freshGroupsAnalyzed, 1);
+    assert.equal(freshCalls, 3, "only the newly changed group should consume fresh analysis");
+    assert.equal(second.needsReview.length, 0);
   });
 
   it("reports candidate groups when no analyzer is configured", async () => {

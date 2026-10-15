@@ -1846,7 +1846,7 @@ describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
     }
   }
 
-  it("applies an exact batch and preserves keeper metadata", async () => {
+  it("applies a dedup-only batch and preserves keeper bytes and metadata", async () => {
     const fixture = await makeFixture(["First distinct fact.", "Second distinct fact."]);
     try {
       const [keep, remove] = fixture.inventory;
@@ -1854,11 +1854,11 @@ describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
       const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
         keep: { index: keep.index, hash: keep.hash },
         remove: [{ index: remove.index, hash: remove.hash }],
-        replacement: "Merged distinct facts.",
       }]);
       assert.equal(result.success, true);
       const after = await fixture.store.readInventory("memory");
-      assert.deepEqual(after.map((entry) => entry.text), ["Merged distinct facts."]);
+      assert.deepEqual(after.map((entry) => entry.text), [keep.text]);
+      assert.equal(after[0].raw, keep.raw, "the surviving entry must remain byte-for-byte unchanged");
       assert.equal(after[0].created, keep.created);
       assert.equal(after[0].lastReferenced, keep.lastReferenced);
     } finally {
@@ -1877,7 +1877,6 @@ describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
       const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
         keep: { index: keep.index, hash: keep.hash },
         remove: [{ index: remove.index, hash: remove.hash }],
-        replacement: "Merged facts.",
       }]);
       assert.equal(result.success, false);
       assert.equal(await readRaw(memoryPath), diskBefore);
@@ -1895,7 +1894,6 @@ describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
       const result = await fixture.store.applyCleanupActions("memory", "wrong-owner", fixture.fingerprint, [{
         keep: { index: keep.index, hash: keep.hash },
         remove: [{ index: remove.index, hash: remove.hash }],
-        replacement: "Merged facts.",
       }]);
       assert.equal(result.success, false);
       assert.equal(result.maintenanceDeferred, true);
@@ -1915,11 +1913,9 @@ describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
       const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
         keep: { index: first.index, hash: first.hash },
         remove: [{ index: second.index, hash: second.hash }],
-        replacement: "Merged first and second.",
       }, {
         keep: { index: third.index, hash: third.hash },
         remove: [{ index: second.index, hash: "0".repeat(64) }],
-        replacement: "Merged second and third.",
       }]);
       assert.equal(result.success, false);
       assert.equal(await readRaw(memoryPath), before);
@@ -1938,30 +1934,9 @@ describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
       const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
         keep: { index: first.index, hash: first.hash },
         remove: [{ index: second.index, hash: second.hash }],
-        replacement: "Merged first and second.",
       }, {
         keep: { index: second.index, hash: second.hash },
         remove: [{ index: third.index, hash: third.hash }],
-        replacement: "Merged second and third.",
-      }]);
-      assert.equal(result.success, false);
-      assert.equal(await readRaw(memoryPath), before);
-    } finally {
-      await fixture.dispose();
-    }
-  });
-
-  it("rejects empty cleanup replacements without changing the store", async () => {
-    const fixture = await makeFixture(["First fact.", "Second fact."]);
-    try {
-      const [keep, remove] = fixture.inventory;
-      await fixture.begin("cleanup-owner");
-      const memoryPath = path.join(fixture.memoryDir, MEMORY_FILE);
-      const before = await readRaw(memoryPath);
-      const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
-        keep: { index: keep.index, hash: keep.hash },
-        remove: [{ index: remove.index, hash: remove.hash }],
-        replacement: "  ",
       }]);
       assert.equal(result.success, false);
       assert.equal(await readRaw(memoryPath), before);
@@ -1980,7 +1955,6 @@ describe("MemoryStore.applyCleanupActions", { concurrency: 1 }, () => {
       const result = await fixture.store.applyCleanupActions("memory", "cleanup-owner", fixture.fingerprint, [{
         keep: { index: fixture.inventory.length, hash: keep.hash },
         remove: [{ index: remove.index, hash: remove.hash }],
-        replacement: "Merged facts.",
       }]);
       assert.equal(result.success, false);
       assert.equal(await readRaw(memoryPath), before);
@@ -2011,7 +1985,7 @@ describe("bulk mutator external-mutation survival (#store-resurrection)", () => 
 
   it("dedupeTarget() survives an external append between load and save", async () => {
     const e1 = "Fahmi never stores ssh keys or hostnames in memory; access is fresh per session." + meta("2026-08-17");
-    const e2 = "Fahmi never stores ssh keys or hostnames in memory — access is fresh per session." + meta("2026-08-17");
+    const e2 = "Fahmi never stores ssh keys or hostnames in memory; access is fresh per session." + meta("2026-08-18");
     const e3 = "Qwen family runs clean on intel arc a770; gemma freezes the pc." + meta("2026-08-17");
     await writeRaw(file, [e1, e2, e3].join(ENTRY_DELIMITER));
     const store = new MemoryStore(makeConfig({ memoryDir: dir }));
@@ -2051,7 +2025,7 @@ describe("bulk mutator external-mutation survival (#store-resurrection)", () => 
 
   it("conflict path retries once and the retried dedupe runs against disk truth", async () => {
     const e1 = "Alpha unique entry for the conflict test." + meta("2026-08-17");
-    const e2 = "Alpha unique entry for the conflict test — reworded so the near-dup check catches it." + meta("2026-08-17");
+    const e2 = "Alpha unique entry for the conflict test." + meta("2026-08-18");
     const e3 = "Beta distinct entry for the conflict test." + meta("2026-08-17");
     await writeRaw(file, [e1, e2, e3].join(ENTRY_DELIMITER));
     const store = new MemoryStore(makeConfig({ memoryDir: dir }));

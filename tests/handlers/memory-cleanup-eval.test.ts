@@ -128,40 +128,42 @@ function fakeSpawn(responder: (args: string[]) => string | Promise<never>) {
   return { spawnFn, calls };
 }
 
-const mergeJson = (replacement: string) =>
-  JSON.stringify({ action: "merge", replacement, rationale: "same facts" });
+const dedupeJson = (keepIndex = 1, removeIndices = [0]) =>
+  JSON.stringify({ action: "deduplicate", keepIndex, removeIndices, rationale: "same facts" });
+const keepBothJson = () => JSON.stringify({ action: "keep_both", rationale: "distinct facts" });
 
-const DEPLOY_A = "Deploy workflow uses npm run build then rsync to host /var/www/app with pm2 reload after every release tag.";
-const DEPLOY_B = "Deploy workflow uses npm run build then rsync to server /var/www/app with pm2 restart after every release tag.";
-const DEPLOY_MERGE = DEPLOY_A + " server restart";
+const DEPLOY_A = "Deploy workflow runs npm build and ships package after every release tag.";
+const DEPLOY_B = "Deploy workflow runs npm build and ships package after every release tag and records the checksum.";
 
 // ─── parseModelResponse ───
 
 describe("parseModelResponse", () => {
-  it("parses a valid fenced merge decision", () => {
-    const text = "Here you go:\n```json\n" + mergeJson("merged text") + "\n```\ndone";
-    const parsed = parseModelResponse(text);
-    assert.equal(parsed.kind, "decision");
-    if (parsed.kind === "decision") {
-      assert.equal(parsed.decision.action, "merge");
-      assert.equal(parsed.decision.replacement, "merged text");
-      assert.equal(parsed.decision.rationale, "same facts");
-    }
+  it("parses selection-only deduplicate decisions", () => {
+    const text = `Here you go:\n\`\`\`json\n${dedupeJson(1, [0])}\n\`\`\`\ndone`;
+    assert.deepEqual(parseModelResponse(text), {
+      kind: "decision",
+      decision: { action: "deduplicate", keepIndex: 1, removeIndices: [0], rationale: "same facts" },
+    });
   });
 
-  it("maps keep_separate and conflict to no-action, never a decision", () => {
-    for (const action of ["keep_separate", "conflict"]) {
-      const parsed = parseModelResponse(JSON.stringify({ action, rationale: "different facts" }));
-      assert.equal(parsed.kind, "no-action");
-      if (parsed.kind === "no-action") assert.equal(parsed.action, action);
-    }
+  it("parses keep_both as a non-mutating decision", () => {
+    assert.deepEqual(parseModelResponse(keepBothJson()), {
+      kind: "decision",
+      decision: { action: "keep_both", rationale: "distinct facts" },
+    });
   });
 
-  it("rejects garbage, unknown actions, and empty merge replacements", () => {
+  it("rejects rewrite actions and invalid member selections", () => {
     assert.equal(parseModelResponse("not json at all").kind, "invalid");
     assert.equal(parseModelResponse('{"action":"replace_all","replacement":"x"}').kind, "invalid");
-    assert.equal(parseModelResponse('{"action":"merge","replacement":"   "}').kind, "invalid");
-    assert.equal(parseModelResponse('{"action":"supersede"}').kind, "invalid");
+    assert.equal(parseModelResponse('{"action":"merge","replacement":"new text"}').kind, "invalid");
+    assert.equal(parseModelResponse('{"action":"supersede","keepIndex":0}').kind, "invalid");
+    assert.equal(parseModelResponse('{"action":"deduplicate","keepIndex":0,"removeIndices":[]}').kind, "invalid");
+    assert.equal(parseModelResponse('{"action":"deduplicate","keepIndex":0,"removeIndices":[0]}').kind, "invalid");
+  });
+
+  it("rejects responses above the byte budget", () => {
+    assert.equal(parseModelResponse(`${" ".repeat(4097)}${keepBothJson()}`).kind, "invalid");
   });
 });
 
@@ -172,14 +174,26 @@ describe("buildGroupPrompt", () => {
     const group = makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)]);
     const { system, user } = buildGroupPrompt(group);
     assert.match(system, /\bdata\b/i, "entries must be labelled untrusted data");
-    assert.match(system, /merge/);
-    assert.match(system, /supersede/);
-    assert.match(system, /keep_separate/);
+    assert.match(system, /deduplicate/);
+    assert.match(system, /keep_both/);
+    assert.doesNotMatch(system, /merge|supersede|replacement/);
     for (const t of [DEPLOY_A, DEPLOY_B]) {
       assert.ok(user.includes(JSON.stringify(t)), "member text must appear JSON-quoted");
     }
     assert.match(system, /"action"/);
-    assert.match(system, /"replacement"/);
+    assert.match(system, /"keepIndex"/);
+    assert.match(system, /"removeIndices"/);
+  });
+
+  it("omits only recognized embedded bookkeeping comments from candidate text", () => {
+    const fact = "The nightly index job rebuilds every search vector after each release tag.";
+    const group = makeGroup([
+      makeEntry(`${fact} <!-- created=2026-09-01, last=2026-09-03 -->`),
+      makeEntry(`${fact} <!-- created=2026-09-02, last=2026-09-04 -->`),
+    ]);
+    const { user } = buildGroupPrompt(group);
+    assert.ok(user.includes(JSON.stringify(fact)));
+    assert.doesNotMatch(user, /created=|last=/);
   });
 });
 
@@ -202,34 +216,50 @@ describe("compareFingerprints", () => {
 // ─── createLunaAnalyzer ───
 
 describe("createLunaAnalyzer", () => {
-  it("returns the parsed decision and records the outcome", async () => {
-    const { spawnFn, calls } = fakeSpawn(() => mergeJson(DEPLOY_MERGE));
+  it("returns a selection-only decision and records the outcome", async () => {
+    const { spawnFn, calls } = fakeSpawn(() => dedupeJson(1, [0]));
     const { analyzer, outcomes } = createLunaAnalyzer({ spawnFn });
-    const group = makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-merge");
+    const group = makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-dedup");
     const decision = await analyzer(group);
-    assert.deepEqual(decision, { action: "merge", replacement: DEPLOY_MERGE, rationale: "same facts" });
+    assert.deepEqual(decision, { action: "deduplicate", keepIndex: 1, removeIndices: [0], rationale: "same facts" });
     assert.equal(calls.length, 1);
     assert.equal(outcomes().length, 1);
-    assert.equal(outcomes()[0].groupId, "g-merge");
+    assert.equal(outcomes()[0].groupId, "g-dedup");
     assert.equal(outcomes()[0].kind, "decision");
   });
 
   it("passes a PI_*-stripped environment to the spawn function", async () => {
-    const { spawnFn, calls } = fakeSpawn(() => mergeJson(DEPLOY_MERGE));
+    const { spawnFn, calls } = fakeSpawn(() => dedupeJson());
     const { analyzer } = createLunaAnalyzer({ spawnFn });
     await analyzer(makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-env"));
     assert.equal(calls.length, 1);
     assert.equal(calls[0].env.PI_SESSION_ID, undefined, "session markers must be stripped");
     assert.ok(calls[0].args.some((a) => a.includes("--no-extensions")), "child must run --no-extensions");
+    assert.equal(
+      calls[0].args.filter((a) => a === "--no-session").length,
+      1,
+      "child must run exactly once with --no-session",
+    );
   });
 
-  it("returns null for keep_separate and records a no-action outcome", async () => {
-    const { spawnFn } = fakeSpawn(() => JSON.stringify({ action: "keep_separate", rationale: "distinct" }));
+  it("returns keep_both without proposing replacement text", async () => {
+    const { spawnFn } = fakeSpawn(() => keepBothJson());
     const { analyzer, outcomes } = createLunaAnalyzer({ spawnFn });
-    const decision = await analyzer(makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-sep"));
-    assert.equal(decision, null);
-    assert.equal(outcomes()[0].kind, "no-action");
-    if (outcomes()[0].kind === "no-action") assert.equal(outcomes()[0].action, "keep_separate");
+    const decision = await analyzer(makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-both"));
+    assert.deepEqual(decision, { action: "keep_both", rationale: "distinct facts" });
+    assert.equal(outcomes()[0].kind, "decision");
+  });
+
+  it("does not spawn when a candidate prompt exceeds the byte budget", async () => {
+    const { spawnFn, calls } = fakeSpawn(() => {
+      throw new Error("oversized prompts must not reach the model");
+    });
+    const { analyzer, outcomes } = createLunaAnalyzer({ spawnFn });
+    const large = "long but useful memory entry ".repeat(300);
+    assert.equal(await analyzer(makeGroup([makeEntry(large), makeEntry(`${large} distinct fact`)], "g-large")), null);
+    assert.equal(calls.length, 0);
+    assert.equal(outcomes()[0].kind, "invalid");
+    assert.match(outcomes()[0].reason ?? "", /prompt.*budget/i);
   });
 
   it("returns null and records invalid on garbage model output", async () => {
@@ -239,9 +269,9 @@ describe("createLunaAnalyzer", () => {
     assert.equal(outcomes()[0].kind, "invalid");
   });
 
-  it("returns null when a supersede keepIndex is out of range", async () => {
+  it("returns null when a dedup member index is out of range", async () => {
     const { spawnFn } = fakeSpawn(() =>
-      JSON.stringify({ action: "supersede", keepIndex: 5, rationale: "x" }),
+      JSON.stringify({ action: "deduplicate", keepIndex: 5, removeIndices: [0], rationale: "x" }),
     );
     const { analyzer, outcomes } = createLunaAnalyzer({ spawnFn });
     assert.equal(await analyzer(makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-oob")), null);
@@ -257,18 +287,39 @@ describe("createLunaAnalyzer", () => {
     assert.equal(outcomes()[0].kind, "spawn-failed");
   });
 
-  it("replays checkpointed groups without spawning again", async () => {
+  it("replays successful checkpointed groups without spawning again", async () => {
     const checkpointPath = path.join(root, "checkpoint.jsonl");
-    const first = createLunaAnalyzer({ spawnFn: fakeSpawn(() => mergeJson(DEPLOY_MERGE)).spawnFn, checkpointPath });
+    const first = createLunaAnalyzer({ spawnFn: fakeSpawn(() => dedupeJson()).spawnFn, checkpointPath });
     const group = makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-cache");
-    assert.deepEqual(await first.analyzer(group), { action: "merge", replacement: DEPLOY_MERGE, rationale: "same facts" });
+    const firstDecision = await first.analyzer(group);
+    assert.deepEqual(firstDecision, { action: "deduplicate", keepIndex: 1, removeIndices: [0], rationale: "same facts" });
+    await first.analyzer.recordValidatedDecision?.(group, firstDecision!);
 
     const { spawnFn, calls } = fakeSpawn(() => {
       throw new Error("must not spawn for a cached group");
     });
     const second = createLunaAnalyzer({ spawnFn, checkpointPath });
-    assert.deepEqual(await second.analyzer(group), { action: "merge", replacement: DEPLOY_MERGE, rationale: "same facts" });
+    assert.deepEqual(await second.analyzer(group), { action: "deduplicate", keepIndex: 1, removeIndices: [0] });
+    const saved = JSON.parse((await fs.readFile(checkpointPath, "utf-8")).trim());
+    assert.equal("rationale" in saved.decision, false, "checkpoint must omit untrusted free-form rationale");
+    assert.equal(await second.analyzer.isCached?.(group), true);
     assert.equal(calls.length, 0, "checkpointed groups must not hit the model");
+  });
+
+  it("does not reuse checkpoint decisions without the current policy version", async () => {
+    const checkpointPath = path.join(root, "legacy-checkpoint.jsonl");
+    const group = makeGroup([makeEntry(DEPLOY_A), makeEntry(DEPLOY_B)], "g-legacy");
+    await fs.writeFile(checkpointPath, `${JSON.stringify({
+      groupId: group.id,
+      kind: "decision",
+      action: "keep_both",
+      decision: { action: "keep_both", rationale: "old policy" },
+    })}\n`, "utf-8");
+    const { spawnFn, calls } = fakeSpawn(() => keepBothJson());
+    const luna = createLunaAnalyzer({ spawnFn, checkpointPath });
+    assert.equal(await luna.analyzer.isCached?.(group), false);
+    assert.deepEqual(await luna.analyzer(group), { action: "keep_both", rationale: "distinct facts" });
+    assert.equal(calls.length, 1, "pre-policy judgments must be recomputed");
   });
 });
 
@@ -281,6 +332,16 @@ describe("defaultSpawnLuna", () => {
       { env: {}, timeoutMs: 30_000 },
     );
     assert.equal(stdout, "spawn-ok");
+  });
+
+  it("terminates and rejects a child that exceeds the stdout byte budget", async () => {
+    await assert.rejects(
+      defaultSpawnLuna(
+        { command: process.execPath, args: ["-e", "process.stdout.write('x'.repeat(10000))"] },
+        { env: {}, timeoutMs: 30_000 },
+      ),
+      /output exceeded .*byte budget/i,
+    );
   });
 
   it("rejects when the child exceeds the timeout", async () => {
@@ -297,10 +358,11 @@ describe("defaultSpawnLuna", () => {
 // ─── runEvalDryRun (read-only, end to end) ───
 
 describe("runEvalDryRun", () => {
-  it("collects a validated LLM merge into plan actions and reports a stable snapshot", async () => {
+  it("keeps an existing complete entry unchanged and removes only its duplicate", async () => {
     const store = await makeStore();
     await seedRaw(store, [DEPLOY_A, DEPLOY_B]);
-    const { spawnFn } = fakeSpawn(() => mergeJson(DEPLOY_MERGE));
+    const keeperIndex = [DEPLOY_A, DEPLOY_B].sort((a, b) => a.localeCompare(b)).indexOf(DEPLOY_B);
+    const { spawnFn } = fakeSpawn(() => dedupeJson(keeperIndex, [1 - keeperIndex]));
     const luna = createLunaAnalyzer({ spawnFn });
 
     const report = await runEvalDryRun({
@@ -309,9 +371,13 @@ describe("runEvalDryRun", () => {
       maxGroups: 10,
     });
 
-    assert.equal(report.plan.actions.length, 1, "the validated merge becomes the only action");
-    assert.equal(report.plan.actions[0].type, "merge");
-    assert.equal(report.plan.actions[0].replacement, DEPLOY_MERGE);
+    assert.equal(report.plan.actions.length, 1, "the redundant entry becomes the only action");
+    assert.equal(report.plan.actions[0].type, "deduplicate");
+    const inventory = await store.readInventory("memory");
+    const expectedKeeper = inventory.find((entry) => entry.text === DEPLOY_B);
+    assert.equal(report.plan.actions[0].keep.hash, expectedKeeper?.hash);
+    assert.equal("replacement" in report.plan.actions[0], false);
+    assert.equal(report.plan.stats.freshGroupsAnalyzed, 1);
     assert.equal(report.snapshotStable, true);
     assert.ok(report.fingerprintsBefore.memory);
     assert.ok(report.elapsedMs >= 0);
@@ -319,17 +385,15 @@ describe("runEvalDryRun", () => {
     assert.equal(report.plan.stats.actionsValidated, 1);
   });
 
-  it("routes a fact-dropping merge replacement to needs-review, never to actions", async () => {
+  it("rejects a selected removal that would lose a hard fact", async () => {
     const store = await makeStore();
     await seedRaw(store, [
-      "CI pipeline runs 3 stages then deploys via webhook to staging every night.",
-      "CI pipeline runs 3 stages then deploys via webhook to staging nightly after tests.",
+      "Cache policy uses version 2 during nightly retries after validation completes.",
+      "Cache policy uses version 3 during nightly retries after validation completes.",
     ]);
-    // Omits the hard fact "3" ("three" spelled out) → planner must reject.
-    const { spawnFn } = fakeSpawn(() =>
-      mergeJson("CI pipeline runs three stages then deploys via webhook to staging every night."),
-    );
-    const luna = createLunaAnalyzer({ spawnFn });
+    const checkpointPath = path.join(root, "safety-rejected.jsonl");
+    const { spawnFn } = fakeSpawn(() => dedupeJson(0, [1]));
+    const luna = createLunaAnalyzer({ spawnFn, checkpointPath });
 
     const report = await runEvalDryRun({
       stores: [{ label: "memory", store, target: "memory" }],
@@ -339,33 +403,83 @@ describe("runEvalDryRun", () => {
 
     assert.equal(report.plan.actions.length, 0);
     assert.equal(report.plan.stats.rejectedToReview, 1);
+    assert.equal(report.plan.stats.safetyRejectedGroups, 1);
+    const checkpoint = (await fs.readFile(checkpointPath, "utf-8")).trim().split("\n").map(JSON.parse);
+    assert.equal(checkpoint.at(-1).kind, "safety-rejected");
+    assert.equal(checkpoint.at(-1).reasonCode, "hard-fact-missing");
+    assert.doesNotMatch(JSON.stringify(checkpoint.at(-1)), /Cache policy uses version/);
   });
 
-  it("keeps a supersede decision only when the planner validates the correction", async () => {
+  it("keeps a conservative keep_both decision without reporting unresolved review", async () => {
     const store = await makeStore();
-    const survivor = "Build cache no longer uses host alpha since 2024; Redis moved to port 6379 on beta.";
-    const victim = "Build cache uses Redis port 6379 on host alpha since 2024.";
-    await seedRaw(store, [survivor, victim]); // member order = seed order → survivor is member 0
-    const { spawnFn } = fakeSpawn(() =>
-      JSON.stringify({ action: "supersede", keepIndex: 0, rationale: "explicit correction" }),
-    );
-    const luna = createLunaAnalyzer({ spawnFn });
-
+    await seedRaw(store, [DEPLOY_A, DEPLOY_B]);
+    const checkpointPath = path.join(root, "keep-both.jsonl");
+    const { spawnFn } = fakeSpawn(() => keepBothJson());
+    const luna = createLunaAnalyzer({ spawnFn, checkpointPath });
     const report = await runEvalDryRun({
       stores: [{ label: "memory", store, target: "memory" }],
       analyzer: luna,
       maxGroups: 10,
     });
+    assert.equal(report.plan.actions.length, 0);
+    assert.equal(report.plan.needsReview.length, 0);
+    assert.equal(report.plan.stats.analyzedGroups, 1);
+    assert.equal(report.plan.stats.keepBothGroups, 1);
+    const checkpoint = (await fs.readFile(checkpointPath, "utf-8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(checkpoint.at(-1).kind, "decision");
+    assert.equal(checkpoint.at(-1).action, "keep_both");
+  });
 
-    assert.equal(report.plan.actions.length, 1, "validated supersede becomes an action");
-    assert.equal(report.plan.actions[0]?.type, "supersede");
-    assert.equal(report.plan.stats.actionsValidated, 1);
+  it("persists failed and deferred outcome codes without entry text", async () => {
+    for (const item of [
+      {
+        kind: "invalid",
+        spawnFn: fakeSpawn(() => "not json").spawnFn,
+        expectedKind: "invalid",
+        expectedCode: "invalid-output",
+      },
+      {
+        kind: "spawn-failed",
+        spawnFn: async () => { throw new Error("child exited 1"); },
+        expectedKind: "spawn-failed",
+        expectedCode: "spawn-failed",
+      },
+    ]) {
+      const store = await makeStore();
+      await seedRaw(store, [DEPLOY_A, DEPLOY_B]);
+      const checkpointPath = path.join(root, `${item.kind}.jsonl`);
+      const report = await runEvalDryRun({
+        stores: [{ label: "memory", store, target: "memory" }],
+        analyzer: createLunaAnalyzer({ spawnFn: item.spawnFn, checkpointPath }),
+      });
+      assert.equal(report.plan.stats.analyzerFailedGroups, 1);
+      const checkpoint = (await fs.readFile(checkpointPath, "utf-8")).trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(checkpoint.at(-1).kind, item.expectedKind);
+      assert.equal(checkpoint.at(-1).reasonCode, item.expectedCode);
+      assert.doesNotMatch(JSON.stringify(checkpoint.at(-1)), /Deploy worker|deploy worker/i);
+    }
+
+    const store = await makeStore();
+    await seedRaw(store, [DEPLOY_A, DEPLOY_B]);
+    const checkpointPath = path.join(root, "deferred.jsonl");
+    const { spawnFn, calls } = fakeSpawn(() => { throw new Error("budgeted group must not spawn"); });
+    const report = await runEvalDryRun({
+      stores: [{ label: "memory", store, target: "memory" }],
+      analyzer: createLunaAnalyzer({ spawnFn, checkpointPath }),
+      maxGroups: 0,
+    });
+    assert.equal(calls.length, 0);
+    assert.equal(report.plan.stats.deferredGroups, 1);
+    const checkpoint = (await fs.readFile(checkpointPath, "utf-8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(checkpoint.at(-1).kind, "deferred");
+    assert.equal(checkpoint.at(-1).reasonCode, "analysis-budget");
+    assert.doesNotMatch(JSON.stringify(checkpoint.at(-1)), /Deploy worker|deploy worker/i);
   });
 
   it("never calls the analyzer for exact duplicates (planner contract)", async () => {
     const store = await makeStore();
     await seedRaw(store, [DEPLOY_A, DEPLOY_A, DEPLOY_B]); // exact pair + near pair
-    const { spawnFn, calls } = fakeSpawn(() => mergeJson(DEPLOY_MERGE));
+    const { spawnFn, calls } = fakeSpawn(() => dedupeJson());
     const luna = createLunaAnalyzer({ spawnFn });
 
     const report = await runEvalDryRun({
@@ -375,14 +489,14 @@ describe("runEvalDryRun", () => {
     });
 
     assert.equal(calls.length, 1, "only the near-duplicate group may reach the model");
-    assert.ok(report.plan.actions.some((a) => a.rationale.includes("Exact duplicate")));
+    assert.ok(report.plan.actions.some((a) => a.rationale.includes("Exact fact duplicate")));
   });
 
   it("is read-only: store files and fingerprints are untouched by the dry run", async () => {
     const store = await makeStore();
     await seedRaw(store, [DEPLOY_A, DEPLOY_B]);
     const before = await fs.readFile(memoryPath, "utf-8");
-    const { spawnFn } = fakeSpawn(() => mergeJson(DEPLOY_MERGE));
+    const { spawnFn } = fakeSpawn(() => dedupeJson());
     const luna = createLunaAnalyzer({ spawnFn });
 
     await runEvalDryRun({

@@ -1,27 +1,7 @@
-// Knowledge-preserving cleanup planner (Task 4 of the memory-cleanup plan).
-//
-// Separates CANDIDATE DISCOVERY from PERMISSION TO DELETE:
-//   - Exact duplicates (decoded text + scope equality) → deterministic merge
-//     actions, no LLM needed.
-//   - Token-similar entries (same store + same scope only) → bounded candidate
-//     groups handed to an injected analyzer (LLM). Similarity NEVER proves
-//     equivalence — every analyzer decision is re-validated deterministically
-//     before it becomes an action.
-//   - Anything ambiguous → needs-review (reported, never mutated).
-//
-// Validation rules (deliberately conservative):
-//   - merge: the replacement must retain every hard fact (numbers/dates/
-//     versions) of each member, ≥80% of each member's significant tokens, and
-//     must not introduce meaningful facts the members don't support.
-//   - supersede: requires an explicit correction cue in the survivor text
-//     ("no longer", "instead", "fixed", ...), recency (survivor at least as
-//     recent as every victim), and no victim hard fact missing from the
-//     survivor. A newer timestamp alone is NOT correction evidence.
-//   - Cross-store or cross-scope entries are never grouped.
-//   - Invalid/null analyzer output → needs-review, never an action.
-//
-// This module NEVER touches the stores. It consumes read-only inventories
-// (MemoryStore.readInventory) and returns a plan; applying it is Task 5.
+// Conservative redundant-entry planner. Similarity only finds candidates;
+// it never grants deletion permission. Decisions keep existing text verbatim,
+// remove only entries covered by the keeper, and never cross store/project scope.
+// This module is read-only; applying its hash-checked plan is a separate step.
 import { createHash } from "node:crypto";
 import type { StoreInventoryEntry } from "../store/memory-store.js";
 
@@ -37,23 +17,30 @@ export interface CandidateGroup {
   similarity: number;
 }
 
-export interface GroupDecision {
-  action: "merge" | "supersede";
-  replacement: string;
-  /** Index (within the group's members array) of the entry kept on supersede. */
-  keepIndex?: number;
-  rationale?: string;
+export type GroupDecision =
+  | { action: "deduplicate"; keepIndex: number; removeIndices: number[]; rationale?: string }
+  | { action: "keep_both"; rationale?: string };
+
+export interface GroupPlanOutcome {
+  kind: "no-action" | "safety-rejected" | "deferred";
+  reasonCode: string;
 }
 
-export type GroupAnalyzer = (group: CandidateGroup) => Promise<GroupDecision | null>;
+export type GroupAnalyzer = ((group: CandidateGroup) => Promise<GroupDecision | null>) & {
+  /** True only when this exact content/scope group has a planner-validated cached result. */
+  isCached?: (group: CandidateGroup) => Promise<boolean>;
+  /** Persist a decision only after deterministic planner validation accepts it. */
+  recordValidatedDecision?: (group: CandidateGroup, decision: GroupDecision) => Promise<void>;
+  /** Persist a compact, non-reusable outcome for reporting. */
+  recordPlanOutcome?: (group: CandidateGroup, outcome: GroupPlanOutcome) => Promise<void>;
+};
 
 export interface PlanAction {
   id: string;
-  type: "merge" | "supersede";
+  type: "deduplicate";
   store: StoreLabel;
   keep: { index: number; hash: string };
   remove: Array<{ index: number; hash: string }>;
-  replacement: string;
   rationale: string;
 }
 
@@ -80,8 +67,14 @@ export interface CleanupPlan {
     exactDuplicateGroups: number;
     candidateGroups: number;
     analyzedGroups: number;
+    freshGroupsAnalyzed: number;
+    cachedGroups: number;
     actionsValidated: number;
     rejectedToReview: number;
+    keepBothGroups: number;
+    safetyRejectedGroups: number;
+    analyzerFailedGroups: number;
+    deferredGroups: number;
   };
 }
 
@@ -94,16 +87,24 @@ const STOPWORDS = new Set([
   "because", "being", "both", "each", "other", "same", "onto", "upon", "via",
 ]);
 
-const CORRECTION_CUE =
-  /\b(no longer|not\b|instead|actually|corrected|fix(?:ed)?|now uses|switched to|moved to|replaced by|replaced with|deprecated|outdated|superseded|updated to|wrong|incorrect|migration|renamed to)\b/i;
-
+const QUALIFIER_WORDS = new Set([
+  "no", "not", "never", "only", "unless", "except", "without", "may", "might",
+  "can", "could", "should", "must", "always", "sometimes", "usually", "rarely",
+  "if", "when", "until", "while", "before", "after", "during", "per", "at", "most", "least", "once", "twice",
+  "production", "staging", "testing", "test", "development", "dev", "local", "universal",
+]);
+export const CLEANUP_POLICY_VERSION = "memory-dedup-v3";
 const SIMILARITY_THRESHOLD = 0.55;
 const MIN_NORMALIZED_LENGTH = 40;
 const MAX_GROUP_SIZE = 4;
-const DEFAULT_MAX_GROUPS = 25;
-const MERGE_TOKEN_COVERAGE = 0.8;
-const MERGE_NEW_TOKEN_RATIO = 0.2;
-const MERGE_NEW_TOKEN_ABS = 3;
+export const DEFAULT_MAX_GROUPS = 25;
+
+const BOOKKEEPING_COMMENT = /<!--\s*(?:(?:created|last)\s*=\s*\d{4}-\d{2}-\d{2})(?:\s*,\s*(?:created|last)\s*=\s*\d{4}-\d{2}-\d{2})*\s*-->/gi;
+
+/** Remove only recognized created/last date comments for comparison; never mutate stored text. */
+export function cleanupComparisonText(text: string): string {
+  return text.replace(BOOKKEEPING_COMMENT, " ").replace(/\s+/g, " ").trim();
+}
 
 export function normalizeText(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
@@ -111,7 +112,7 @@ export function normalizeText(text: string): string {
 
 export function significantTokens(text: string): Set<string> {
   return new Set(
-    normalizeText(text)
+    normalizeText(cleanupComparisonText(text))
       .split(" ")
       .filter((t) => t.length > 3 && !STOPWORDS.has(t)),
   );
@@ -119,7 +120,7 @@ export function significantTokens(text: string): Set<string> {
 
 /** Hard facts = numbers, dates, versions. Losing one is always a regression. */
 export function hardFacts(text: string): Set<string> {
-  return new Set(normalizeText(text).match(/\d+(?:\.\d+)*/g) ?? []);
+  return new Set(normalizeText(cleanupComparisonText(text)).match(/\d+(?:\.\d+)*/g) ?? []);
 }
 
 function jaccard(a: Set<string>, b: Set<string>): number {
@@ -143,8 +144,12 @@ function entryId(entry: PlanningEntry): string {
 }
 
 function planId(entries: PlanningEntry[]): string {
+  const identity = entries
+    .map((entry) => JSON.stringify([entry.store, entry.project ?? null, cleanupComparisonText(entry.text)]))
+    .sort()
+    .join("|");
   return createHash("sha256")
-    .update(entries.map((e) => `${e.store}:${e.index}:${e.hash}`).join("|"))
+    .update(`${CLEANUP_POLICY_VERSION}|${identity}`)
     .digest("hex")
     .slice(0, 12);
 }
@@ -153,6 +158,7 @@ export interface PlanCleanupOptions {
   analyze?: GroupAnalyzer | null;
   maxGroups?: number;
   now?: string;
+  onProgress?: (completed: number, total: number) => void;
 }
 
 export interface InventoryInput {
@@ -171,7 +177,7 @@ export async function planCleanup(
   opts: PlanCleanupOptions = {},
 ): Promise<CleanupPlan> {
   const analyze = opts.analyze ?? null;
-  const maxGroups = opts.maxGroups ?? DEFAULT_MAX_GROUPS;
+  const maxGroups = Math.max(0, Math.floor(opts.maxGroups ?? DEFAULT_MAX_GROUPS));
 
   const all: PlanningEntry[] = [];
   const fingerprints: StoreFingerprints = {};
@@ -187,15 +193,19 @@ export async function planCleanup(
   let analyzedGroups = 0;
   let actionsValidated = 0;
   let rejectedToReview = 0;
+  let keepBothGroups = 0;
+  let safetyRejectedGroups = 0;
+  let analyzerFailedGroups = 0;
+  let deferredGroups = 0;
 
   const consumed = new Set<string>(); // entryIds already covered by an action
 
-  // ---- Phase A: exact duplicates (decoded content + scope equality) -------
+  // ---- Phase A: exact fact text + scope equality (timestamps are bookkeeping) ----
   const exactGroups = new Map<string, PlanningEntry[]>();
   for (const entry of all) {
-    const norm = normalizeText(entry.text);
-    if (!norm) continue;
-    const key = `${scopeKey(entry)}::${norm}`;
+    const factText = cleanupComparisonText(entry.text);
+    if (factText === "") continue;
+    const key = JSON.stringify([scopeKey(entry), factText]);
     const list = exactGroups.get(key);
     if (list) list.push(entry);
     else exactGroups.set(key, [entry]);
@@ -203,8 +213,7 @@ export async function planCleanup(
   for (const group of exactGroups.values()) {
     if (group.length < 2) continue;
     exactDuplicateGroups++;
-    // Keep the most recently referenced member (tie: lowest index). The
-    // replacement text is the shared text itself.
+    // Keep the most recently referenced member (tie: lowest index); its raw bytes remain unchanged.
     const sorted = [...group].sort((a, b) =>
       b.lastReferenced.localeCompare(a.lastReferenced) || a.index - b.index,
     );
@@ -213,12 +222,11 @@ export async function planCleanup(
     for (const e of remove) consumed.add(entryId(e));
     actions.push({
       id: planId(group),
-      type: "merge",
+      type: "deduplicate",
       store: keep.store,
       keep: entryRef(keep),
       remove: remove.map(entryRef),
-      replacement: keep.text,
-      rationale: "Exact duplicate (identical normalized content and scope); kept the most recently referenced copy.",
+      rationale: "Exact fact duplicate in the same scope (created/last bookkeeping comments ignored); keeper unchanged.",
     });
   }
 
@@ -238,8 +246,8 @@ export async function planCleanup(
       const sim = jaccard(tokensById.get(entryId(a))!, tokensById.get(entryId(b))!);
       if (sim < SIMILARITY_THRESHOLD) continue;
       if (
-        normalizeText(a.text).length < MIN_NORMALIZED_LENGTH ||
-        normalizeText(b.text).length < MIN_NORMALIZED_LENGTH
+        normalizeText(cleanupComparisonText(a.text)).length < MIN_NORMALIZED_LENGTH ||
+        normalizeText(cleanupComparisonText(b.text)).length < MIN_NORMALIZED_LENGTH
       ) {
         continue; // tiny entries: token overlap is too weak a signal
       }
@@ -284,10 +292,11 @@ export async function planCleanup(
         return best;
       }),
     );
-    groups.push({ id: planId(group), members: group, similarity: sim });
+    // Stable member order keeps cached keep/remove indices attached to the same text.
+    const members = [...group].sort((a, b) => cleanupComparisonText(a.text).localeCompare(cleanupComparisonText(b.text)));
+    groups.push({ id: planId(members), members, similarity: sim });
   }
   groups.sort((x, y) => y.similarity - x.similarity);
-  const bounded = groups.slice(0, maxGroups);
   candidateGroups = groups.length;
 
   if (!analyze) {
@@ -310,13 +319,55 @@ export async function planCleanup(
         exactDuplicateGroups,
         candidateGroups,
         analyzedGroups: 0,
+        freshGroupsAnalyzed: 0,
+        cachedGroups: 0,
         actionsValidated,
         rejectedToReview,
+        keepBothGroups,
+        safetyRejectedGroups,
+        analyzerFailedGroups,
+        deferredGroups: groups.length,
       },
     };
   }
 
-  for (const group of bounded) {
+  // Successful cached decisions do not consume this run's fresh-analysis budget.
+  // This also lets later uncached groups progress past cached keep-both groups.
+  const bounded: CandidateGroup[] = [];
+  const cachedById = new Map<string, boolean>();
+  let freshBudgetUsed = 0;
+  for (const group of groups) {
+    let cached = false;
+    try {
+      cached = await analyze.isCached?.(group) ?? false;
+    } catch {
+      cached = false;
+    }
+    cachedById.set(group.id, cached);
+    if (cached || freshBudgetUsed < maxGroups) {
+      bounded.push(group);
+      if (!cached) freshBudgetUsed++;
+    }
+  }
+
+  let freshGroupsAnalyzed = 0;
+  let cachedGroups = 0;
+  const reportProgress = (completed: number, total: number) => {
+    try {
+      opts.onProgress?.(completed, total);
+    } catch {
+      // Progress is best-effort and must not affect planning.
+    }
+  };
+  const recordOutcome = async (group: CandidateGroup, outcome: GroupPlanOutcome) => {
+    try { await analyze.recordPlanOutcome?.(group, outcome); } catch { /* best-effort report */ }
+  };
+  if (bounded.length > 0) reportProgress(0, bounded.length);
+
+  for (const [index, group] of bounded.entries()) {
+    const cached = cachedById.get(group.id) ?? false;
+    if (cached) cachedGroups++;
+    else freshGroupsAnalyzed++;
     let decision: GroupDecision | null = null;
     try {
       decision = await analyze(group);
@@ -324,6 +375,7 @@ export async function planCleanup(
       decision = null;
     }
     if (decision) analyzedGroups++;
+    reportProgress(index + 1, bounded.length);
     const review = (reason: string) => {
       rejectedToReview++;
       needsReview.push({
@@ -333,66 +385,69 @@ export async function planCleanup(
       });
     };
     if (!decision) {
+      analyzerFailedGroups++;
+      await recordOutcome(group, { kind: "no-action", reasonCode: "no-usable-decision" });
       review("Analyzer returned no usable decision for this group.");
       continue;
     }
-    if (decision.action !== "merge" && decision.action !== "supersede") {
+    if (decision.action === "keep_both") {
+      keepBothGroups++;
+      try { await analyze.recordValidatedDecision?.(group, decision); } catch { /* best-effort cache */ }
+      continue;
+    }
+    if (decision.action !== "deduplicate") {
+      safetyRejectedGroups++;
+      await recordOutcome(group, { kind: "safety-rejected", reasonCode: "invalid-action" });
       review(`Unknown action "${String((decision as { action?: unknown }).action)}".`);
       continue;
     }
-    const replacement = String(decision.replacement ?? "").trim();
-    if (decision.action === "merge" && !normalizeText(replacement)) {
-      review("Decision carried an empty replacement.");
+    const keepIdx = decision.keepIndex;
+    const removeIndices = decision.removeIndices;
+    if (!Number.isInteger(keepIdx) || keepIdx < 0 || keepIdx >= group.members.length) {
+      safetyRejectedGroups++;
+      await recordOutcome(group, { kind: "safety-rejected", reasonCode: "invalid-keeper" });
+      review("Deduplication decision did not identify a surviving member as keeper.");
       continue;
     }
-    if (decision.action === "merge") {
-      const result = validateMerge(group.members, replacement);
-      if (!result.ok) {
-        review(result.reason);
-        continue;
-      }
-      actionsValidated++;
-      actions.push({
-        id: planId(group.members),
-        type: "merge",
-        store: group.members[0].store,
-        keep: entryRef(group.members[0]),
-        remove: group.members.slice(1).map(entryRef),
-        replacement,
-        rationale: decision.rationale ?? "Analyzer-validated merge of similar entries.",
-      });
-    } else {
-      const keepIdx = typeof decision.keepIndex === "number" ? decision.keepIndex : -1;
-      if (keepIdx < 0 || keepIdx >= group.members.length) {
-        review("Supersede decision did not identify a surviving member.");
-        continue;
-      }
-      const survivor = group.members[keepIdx];
-      const victims = group.members.filter((_, i) => i !== keepIdx);
-      const result = validateSupersede(survivor, victims);
-      if (!result.ok) {
-        review(result.reason);
-        continue;
-      }
-      actionsValidated++;
-      actions.push({
-        id: planId(group.members),
-        type: "supersede",
-        store: survivor.store,
-        keep: entryRef(survivor),
-        remove: victims.map(entryRef),
-        replacement: survivor.text,
-        rationale: decision.rationale ?? "Explicit correction evidence validated.",
-      });
+    if (!Array.isArray(removeIndices) || removeIndices.length === 0
+      || removeIndices.some((i) => !Number.isInteger(i) || i < 0 || i >= group.members.length || i === keepIdx)
+      || new Set(removeIndices).size !== removeIndices.length) {
+      safetyRejectedGroups++;
+      await recordOutcome(group, { kind: "safety-rejected", reasonCode: "invalid-selection" });
+      review("Deduplication decision has invalid or overlapping member indices.");
+      continue;
     }
+    const keeper = group.members[keepIdx];
+    const victims = removeIndices.map((i) => group.members[i]);
+    const result = validateDeduplicate(keeper, victims);
+    if (!result.ok) {
+      safetyRejectedGroups++;
+      await recordOutcome(group, { kind: "safety-rejected", reasonCode: result.reasonCode });
+      review(result.reason);
+      continue;
+    }
+    actionsValidated++;
+    try { await analyze.recordValidatedDecision?.(group, decision); } catch { /* best-effort cache */ }
+    actions.push({
+      id: planId([keeper, ...victims]),
+      type: "deduplicate",
+      store: keeper.store,
+      keep: entryRef(keeper),
+      remove: victims.map(entryRef),
+      rationale: decision.rationale ?? "Existing entry fully covers the selected redundant entries.",
+    });
   }
 
-  // Groups beyond the bound are reported, not analyzed.
-  for (const group of groups.slice(maxGroups)) {
+  // Uncached groups beyond the fresh-analysis budget wait for a later run.
+  const boundedIds = new Set(bounded.map((group) => group.id));
+  for (const group of groups) {
+    if (boundedIds.has(group.id)) continue;
+    deferredGroups++;
+    await recordOutcome(group, { kind: "deferred", reasonCode: "analysis-budget" });
     needsReview.push({
       store: group.members[0].store,
       entries: group.members.map((m) => ({ index: m.index, hash: m.hash, text: m.text })),
-      reason: `Analysis budget reached (${maxGroups} groups); left for a later pass.`,
+      reason: `Analysis budget reached (${maxGroups} uncached groups); left for a later run.`,
     });
   }
 
@@ -406,79 +461,49 @@ export async function planCleanup(
       exactDuplicateGroups,
       candidateGroups,
       analyzedGroups,
+      freshGroupsAnalyzed,
+      cachedGroups,
       actionsValidated,
       rejectedToReview,
+      keepBothGroups,
+      safetyRejectedGroups,
+      analyzerFailedGroups,
+      deferredGroups,
     },
   };
 }
 
-type ValidationResult = { ok: true } | { ok: false; reason: string };
+type ValidationResult = { ok: true } | { ok: false; reason: string; reasonCode: string };
 
-/**
- * merge: replacement must retain each member's hard facts, cover ≥80% of each
- * member's significant tokens, and not introduce meaningful unsupported facts.
- */
-function validateMerge(members: PlanningEntry[], replacement: string): ValidationResult {
-  const replTokens = significantTokens(replacement);
-  const replFacts = hardFacts(replacement);
-  const union = new Set<string>();
-  for (const m of members) for (const t of significantTokens(m.text)) union.add(t);
-
-  for (const m of members) {
-    for (const fact of hardFacts(m.text)) {
-      if (!replFacts.has(fact)) {
-        return { ok: false, reason: `Replacement omits hard fact "${fact}" from "${truncate(m.text)}".` };
-      }
-    }
-    const tokens = tokensOf(m.text);
-    if (tokens.size) {
-      let covered = 0;
-      for (const t of tokens) if (replTokens.has(t)) covered++;
-      if (covered / tokens.size < MERGE_TOKEN_COVERAGE) {
-        return { ok: false, reason: `Replacement loses content of "${truncate(m.text)}" (coverage ${(covered / tokens.size).toFixed(2)}).` };
-      }
-    }
+function qualifierTokens(text: string): Set<string> {
+  const normalized = normalizeText(cleanupComparisonText(text)).replace(/\b(each|every)\b/g, "universal");
+  const tokens = new Set(normalized.split(" ").filter((word) => QUALIFIER_WORDS.has(word)));
+  for (const match of normalized.matchAll(/\b(project|scenario|environment|workspace|tenant)\s+([a-z0-9_-]+)\b/g)) {
+    tokens.add(`${match[1]}:${match[2]}`);
   }
-  const novel = [...replTokens].filter((t) => !union.has(t));
-  if (novel.length > MERGE_NEW_TOKEN_ABS && novel.length / Math.max(replTokens.size, 1) > MERGE_NEW_TOKEN_RATIO) {
-    return { ok: false, reason: `Replacement introduces unsupported facts: ${truncate(novel.join(", "))}.` };
-  }
-  return { ok: true };
+  return tokens;
 }
 
-/**
- * supersede: survivor must carry an explicit correction cue, be at least as
- * recent as every victim, and contain every victim hard fact (a missing one
- * means conflicting versions/dates, not a correction).
- */
-function validateSupersede(survivor: PlanningEntry, victims: PlanningEntry[]): ValidationResult {
-  if (!CORRECTION_CUE.test(survivor.text)) {
-    return {
-      ok: false,
-      reason: `No explicit correction cue in survivor "${truncate(survivor.text)}" — recency alone is not correction evidence.`,
-    };
-  }
+/** A removal is allowed only within scope and when high-risk facts match. */
+function validateDeduplicate(keeper: PlanningEntry, victims: PlanningEntry[]): ValidationResult {
+  const keeperFacts = hardFacts(keeper.text);
+  const keeperQualifiers = qualifierTokens(keeper.text);
   for (const victim of victims) {
-    if (survivor.lastReferenced.localeCompare(victim.lastReferenced) < 0) {
-      return { ok: false, reason: `Survivor is older than victim "${truncate(victim.text)}".` };
+    if (victim.store !== keeper.store || (victim.project ?? null) !== (keeper.project ?? null)) {
+      return { ok: false, reason: "Entries have different store/project scopes.", reasonCode: "scope-mismatch" };
     }
     for (const fact of hardFacts(victim.text)) {
-      if (!hardFacts(survivor.text).has(fact)) {
-        return { ok: false, reason: `Victim hard fact "${fact}" missing from survivor — conflicting details, not a correction.` };
+      if (!keeperFacts.has(fact)) {
+        return { ok: false, reason: `Keeper omits hard fact "${fact}" from "${truncate(victim.text)}".`, reasonCode: "hard-fact-missing" };
       }
+    }
+    const victimQualifiers = qualifierTokens(victim.text);
+    if (victimQualifiers.size !== keeperQualifiers.size
+      || [...victimQualifiers].some((word) => !keeperQualifiers.has(word))) {
+      return { ok: false, reason: `Keeper and removed entry qualifiers differ (conditions/negation) ("${truncate(victim.text)}").`, reasonCode: "qualifier-mismatch" };
     }
   }
   return { ok: true };
-}
-
-const tokenCache = new Map<string, Set<string>>();
-function tokensOf(text: string): Set<string> {
-  let t = tokenCache.get(text);
-  if (!t) {
-    t = significantTokens(text);
-    if (tokenCache.size < 10_000) tokenCache.set(text, t);
-  }
-  return t;
 }
 
 function truncate(text: string, max = 80): string {

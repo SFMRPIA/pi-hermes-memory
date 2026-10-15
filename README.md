@@ -403,7 +403,7 @@ This means skills build up naturally over time without you having to ask.
 | `/memory-switch-project` | List all project memories and their entry counts |
 | `/memory-index-sessions` | Import past Pi sessions into the search database |
 | `/memory-sync-markdown` | Backfill Markdown memories into the SQLite search store |
-| `/memory-cleanup` | Preview and apply knowledge-preserving memory dedup (`apply`, `status`, `recover` subcommands) |
+| `/memory-cleanup` | Preview/apply dedup only (exact repeats need no model; at most 25 fresh semantic checks per run; validated judgments are cached by content and scope; uncertain entries stay untouched; `apply` runs up to 3 passes) |
 | `/memory-preview-context` | Preview the memory policy or legacy memory blocks appended to the system prompt |
 | `/learn-memory-tool` | Skill that teaches users how to use the memory system |
 

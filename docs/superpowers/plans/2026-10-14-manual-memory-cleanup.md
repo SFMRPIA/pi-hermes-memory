@@ -131,6 +131,20 @@ The sync gate accepts only one ordered `baseline` → `apply` → `verify` stage
 
 ---
 
+## Follow-up (2026-10-14, approved m02255): single-invocation multi-pass
+
+**Status: DONE.** User asked why one `apply` cannot clean everything (repeated manual runs kept finding more).
+
+**Change:** `runMemoryCleanup` now loops plan→apply up to `maxPasses` (`CleanupRunOptions.maxPasses`, default `DEFAULT_MAX_PASSES = 3`, clamped min 1), re-planning from fresh inventory + fingerprints every pass. Termination is structural: every applied action strictly shrinks the entry count; a pass that plans 0 actions ends the loop early.
+
+**Safety invariants kept:** one maintenance token / baseline→apply→verify stage order (loop sits between baseline and apply-sync); backups + journal created once before the FIRST mutating apply and never re-copied (always pre-cleanup state); journal gains `pass` + `passHistory`; planning failure before any mutation ⇒ clean abort, after a mutating pass ⇒ recovery-required with backupDir; needs-review entries are never force-merged.
+
+**Files:** `src/handlers/memory-cleanup.ts` (loop + `passes` result field + pass-scoped progress `Pass N · …`), `src/handlers/memory-cleanup-command.ts` (`Passes: N` line only when N > 1), tests: 4 new runner tests + 1 new command test, 2 old progress assertions updated to exact `Pass 1 · …` strings (Array.includes is exact-match).
+
+**Verification:** targeted suites 107/107; `npm run check` clean; `git diff --check` clean. Pi restart required; not committed.
+
+---
+
 ## Execution notes
 
 - Per task: failing tests → minimal implementation → targeted tests → diff review. Final: `npm run check`, targeted suites, `npm test` (separate pre-existing env failures), sandbox crash/simulated-writer runs. Restart Pi before any authorized live smoke test.
