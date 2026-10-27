@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added a composite SQLite index for exact memory scope/content lookups, including recreation after legacy table migration (upstream [#293](https://github.com/chandra447/pi-hermes-memory/pull/293)).
 
+## [Unreleased] — fork port of upstream #283
+
+### Fixed
+
+- **Multiline Markdown metadata parsing**: trailing `created`, `last`, and `project64` metadata is now recognized after multiline entry text, preserving SQLite dates and project-scoped failure routing (upstream [#283](https://github.com/chandra447/pi-hermes-memory/pull/283)).
+
 ## [Unreleased] — fork port of upstream v0.9.10 usage-hit tracking (#262)
 
 ### Added

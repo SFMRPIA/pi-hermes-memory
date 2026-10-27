@@ -154,6 +154,40 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(parsed.lastReferenced, '2026-05-09');
     });
 
+    it('parses multiline entry bodies and trailing metadata', () => {
+      const raw = 'first body line\nsecond body line\n<!-- created=2026-05-08, last=2026-05-09 -->';
+
+      const parsed = parseMarkdownMemoryEntry(raw, 'memory');
+
+      assert.strictEqual(parsed.content, 'first body line\nsecond body line');
+      assert.strictEqual(parsed.created, '2026-05-08');
+      assert.strictEqual(parsed.lastReferenced, '2026-05-09');
+    });
+
+    it('preserves the fallback for malformed trailing metadata', () => {
+      const raw = 'first body line\n<!-- created=not-a-date last=2026-05-09 -->';
+
+      const parsed = parseMarkdownMemoryEntry(raw, 'memory');
+
+      assert.strictEqual(parsed.content, raw);
+      assert.match(parsed.created, /^\d{4}-\d{2}-\d{2}$/);
+      assert.strictEqual(parsed.lastReferenced, parsed.created);
+    });
+
+    it('reconciles multiline project-scoped failure metadata', () => {
+      const raw = '[correction] first failure line\nsecond failure line — Failed: first cause\nsecond cause <!-- created=2026-05-08, last=2026-05-09, project64=cHJvamVjdC1h -->';
+
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      const projectEntries = getMemories(dbManager, { target: 'failure', project: 'project-a' });
+      assert.strictEqual(projectEntries.length, 1);
+      assert.strictEqual(projectEntries[0].content, '[correction] first failure line\nsecond failure line — Failed: first cause\nsecond cause');
+      assert.strictEqual(projectEntries[0].created, '2026-05-08');
+      assert.strictEqual(projectEntries[0].lastReferenced, '2026-05-09');
+      assert.strictEqual(projectEntries[0].failureReason, 'first cause\nsecond cause');
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
+    });
+
     it('does not infer project scope from spoofable failure content', () => {
       const raw = '[correction] literal user text — Project: other-project <!-- created=2026-05-08, last=2026-05-09 -->';
 
@@ -396,6 +430,27 @@ describe('sqlite-memory-store', () => {
       );
       const rewritten = JSON.parse(readMdsyncValue(dbManager, 'memory', null)!) as { entryCount: number };
       assert.strictEqual(rewritten.entryCount, 1);
+    });
+
+    it('force-repairs a fingerprint-matched multiline project failure row', () => {
+      const raw = '[correction] multiline failure\ncontinued details — Failed: original cause\ncontinued cause <!-- created=2026-05-08, last=2026-05-09, project64=cHJvamVjdC1h -->';
+      reconcileMarkdownMemoryScope(dbManager, [raw], 'failure', 'project-a');
+      dbManager.getDb().prepare(`
+        UPDATE memories SET content = ? WHERE target = 'failure' AND project = 'project-a'
+      `).run(raw);
+
+      const skipped = reconcileMarkdownMemoryScope(dbManager, [raw], 'failure', 'project-a');
+      assert.deepStrictEqual(skipped, { inserted: 0, existing: 1, removed: 0 });
+      assert.match(getMemories(dbManager, { target: 'failure', project: 'project-a' })[0].content, /project64=/);
+
+      reconcileMarkdownFailureScopes(dbManager, [raw], { force: true });
+
+      const repaired = getMemories(dbManager, { target: 'failure', project: 'project-a' });
+      assert.strictEqual(repaired.length, 1);
+      assert.strictEqual(repaired[0].content, '[correction] multiline failure\ncontinued details — Failed: original cause\ncontinued cause');
+      assert.strictEqual(repaired[0].created, '2026-05-08');
+      assert.strictEqual(repaired[0].lastReferenced, '2026-05-09');
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
     });
 
     it('drops the fingerprint when the force path empties a scope', () => {
