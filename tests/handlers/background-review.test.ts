@@ -241,6 +241,12 @@ describe("setupBackgroundReview", () => {
     const cmdArgs = logicalChildArgs(0);
     assert.ok(cmdArgs[0] === "-p", "should use -p flag");
     assert.ok(cmdArgs.includes("--no-session"), "should include --no-session");
+    assert.equal(cmdArgs.includes("--no-tools"), false, "memory-write children must retain the memory tool");
+    const toolsIndex = cmdArgs.indexOf("--tools");
+    assert.ok(toolsIndex >= 0, "memory-write children must explicitly allow tools");
+    assert.equal(cmdArgs[toolsIndex + 1], "memory");
+    assert.equal(cmdArgs[toolsIndex + 2], "--exclude-tools");
+    assert.equal(cmdArgs[toolsIndex + 3], "mcp__*");
     const prompt = reviewPrompt(0);
     assert.match(prompt, /Do NOT create or modify skills in this background review/i);
     assert.doesNotMatch(prompt, /save a reusable procedure using the skill tool/i);

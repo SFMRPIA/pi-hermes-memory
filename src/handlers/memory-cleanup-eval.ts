@@ -341,6 +341,8 @@ export function createLunaAnalyzer(options: LunaAnalyzerOptions = {}): LunaAnaly
     const invocation = resolveChildPiInvocation([
       "--no-extensions",
       "--no-session",
+      "--no-tools",
+      "--exclude-tools", "mcp__*",
       "--model", model,
       "--thinking", thinking,
       "-p", `@${promptPath}`,

@@ -240,6 +240,11 @@ describe("createLunaAnalyzer", () => {
       1,
       "child must run exactly once with --no-session",
     );
+    assert.equal(calls[0].args.filter((a) => a === "--no-tools").length, 1);
+    assert.equal(calls[0].args.includes("--tools"), false);
+    const excludeIndex = calls[0].args.indexOf("--exclude-tools");
+    assert.ok(excludeIndex >= 0);
+    assert.equal(calls[0].args[excludeIndex + 1], "mcp__*");
   });
 
   it("returns keep_both without proposing replacement text", async () => {

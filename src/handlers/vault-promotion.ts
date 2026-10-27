@@ -221,6 +221,7 @@ async function runVaultPromotionInner(
     }, {
       timeoutMs: config.consolidationTimeoutMs,
       retryWithoutOverrides: true,
+      toolMode: "none",
     });
   } catch (err) {
     return { promoted: 0, removed: 0, error: `Promotion child failed: ${String(err).slice(0, 200)}` };

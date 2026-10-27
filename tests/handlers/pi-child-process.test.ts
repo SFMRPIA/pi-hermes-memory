@@ -24,10 +24,12 @@ function logicalChildArgs(call: { cmd: string; args: string[] }): string[] {
 // Compute the expected OWN_EXTENSION_PATH same logic as pi-child-process.ts
 const OWN_EXTENSION_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
-  "../../src/index.ts",
+  "../../src/consolidation-child.ts",
 );
 
-const EXT_ARGS = ["--no-extensions", "-e", OWN_EXTENSION_PATH];
+const MEMORY_TOOL_ARGS = ["--tools", "memory", "--exclude-tools", "mcp__*"];
+const EXT_ARGS = ["--no-extensions", "-e", OWN_EXTENSION_PATH, ...MEMORY_TOOL_ARGS];
+const NO_TOOL_ARGS = ["--no-tools", "--exclude-tools", "mcp__*"];
 
 describe("inheritedExtensionArgs", () => {
   it("captures explicit -e and --extension parent args", () => {
@@ -214,6 +216,20 @@ describe("buildChildPiPromptArgs", () => {
     );
   });
 
+  it("supports a no-tool child mode", () => {
+    assert.deepStrictEqual(
+      buildChildPiPromptArgs("hello", {}, [], "none" as any),
+      ["-p", "--no-session", "--no-extensions", "-e", OWN_EXTENSION_PATH, ...NO_TOOL_ARGS, "hello"],
+    );
+  });
+
+  it("rejects an unsupported child tool mode", () => {
+    assert.throws(
+      () => buildChildPiPromptArgs("hello", {}, [], "all" as any),
+      /tool mode/i,
+    );
+  });
+
   it("adds a model override and defaults thinking to off", () => {
     assert.deepStrictEqual(
       buildChildPiPromptArgs("hello", { llmModelOverride: "openrouter/deepseek/deepseek-v4-flash" }, []),
@@ -250,6 +266,7 @@ describe("buildChildPiPromptArgs", () => {
           "-p", "--no-session", "--no-extensions",
           "-e", OWN_EXTENSION_PATH,
           "-e", configured,
+          ...MEMORY_TOOL_ARGS,
           "hello",
         ],
       );
@@ -665,6 +682,34 @@ describe("execChildPrompt", () => {
       ["-p", "--no-session", "--model", "openrouter/deepseek/deepseek-v4-flash", "--thinking", "off", ...EXT_ARGS, promptReference],
       // Retry path (basePromptArgs) also passes --no-extensions + own path.
       ["-p", "--no-session", ...EXT_ARGS, promptReference],
+    ]);
+  });
+
+  it("preserves no-tool mode across override retry attempts", async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const pi = {
+      exec: async (cmd: string, args: string[]) => {
+        calls.push({ cmd, args });
+        return calls.length === 1
+          ? { code: 1, stdout: "", stderr: "model not found" }
+          : { code: 0, stdout: "ok", stderr: "" };
+      },
+    };
+
+    const result = await execChildPrompt(pi as any, "hello", {
+      llmModelOverride: "openrouter/deepseek/deepseek-v4-flash",
+    }, {
+      timeoutMs: 30000,
+      retryWithoutOverrides: true,
+      toolMode: "none" as any,
+    });
+
+    assert.equal(result.code, 0);
+    assert.equal(calls.length, 2);
+    const promptReference = logicalChildArgs(calls[0]).at(-1)!;
+    assert.deepStrictEqual(calls.map(logicalChildArgs), [
+      ["-p", "--no-session", "--model", "openrouter/deepseek/deepseek-v4-flash", "--thinking", "off", "--no-extensions", "-e", OWN_EXTENSION_PATH, ...NO_TOOL_ARGS, promptReference],
+      ["-p", "--no-session", "--no-extensions", "-e", OWN_EXTENSION_PATH, ...NO_TOOL_ARGS, promptReference],
     ]);
   });
 

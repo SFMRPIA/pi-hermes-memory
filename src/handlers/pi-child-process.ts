@@ -17,10 +17,13 @@ interface PiExecResult {
   killed?: boolean;
 }
 
+export type ChildToolMode = "memory-write" | "none";
+
 interface ExecChildPromptOptions {
   signal?: AbortSignal;
   timeoutMs: number;
   retryWithoutOverrides?: boolean;
+  toolMode?: ChildToolMode;
 }
 
 interface ExecChildPromptDependencies {
@@ -224,19 +227,31 @@ function childExtensionPaths(config: ChildLlmConfig): string[] {
   return paths;
 }
 
-function appendOwnExtensionArgs(args: string[], config: ChildLlmConfig): void {
+function childToolPolicyArgs(toolMode: ChildToolMode): string[] {
+  if (toolMode === "memory-write") {
+    return ["--tools", "memory", "--exclude-tools", "mcp__*"];
+  }
+  if (toolMode === "none") {
+    return ["--no-tools", "--exclude-tools", "mcp__*"];
+  }
+  throw new Error(`Unsupported child tool mode: ${String(toolMode)}`);
+}
+
+function appendOwnExtensionArgs(args: string[], config: ChildLlmConfig, toolMode: ChildToolMode): void {
   // Skip all packages from settings.json (--no-extensions) — the subprocess
   // loads only Hermes and explicitly required provider adapters.
   args.push("--no-extensions");
   for (const extensionPath of childExtensionPaths(config)) {
     args.push("-e", extensionPath);
   }
+  args.push(...childToolPolicyArgs(toolMode));
 }
 
 export function buildChildPiPromptArgs(
   prompt: string,
   config: ChildLlmConfig,
   _argv: string[] = process.argv.slice(2),
+  toolMode: ChildToolMode = "memory-write",
 ): string[] {
   const args = ["-p", "--no-session"];
   const model = normalizedModelOverride(config);
@@ -244,17 +259,21 @@ export function buildChildPiPromptArgs(
 
   if (model) args.push("--model", model);
   if (thinking) args.push("--thinking", thinking);
-  appendOwnExtensionArgs(args, config);
+  appendOwnExtensionArgs(args, config, toolMode);
   args.push(prompt);
 
   return args;
 }
 
-function basePromptArgs(prompt: string, config: ChildLlmConfig): string[] {
+function basePromptArgs(
+  prompt: string,
+  config: ChildLlmConfig,
+  toolMode: ChildToolMode = "memory-write",
+): string[] {
   // Always use --no-extensions + own path so the retry also avoids loading
   // all settings.json packages — matching the primary code path.
   const args = ["-p", "--no-session"];
-  appendOwnExtensionArgs(args, config);
+  appendOwnExtensionArgs(args, config, toolMode);
   args.push(prompt);
   return args;
 }
@@ -411,7 +430,7 @@ export async function execChildPrompt(
     let attempt = "primary";
     try {
       const invocation = resolveWatchedChildPiInvocation(
-        resolveChildPiInvocation(buildChildPiPromptArgs(promptReference, config)),
+        resolveChildPiInvocation(buildChildPiPromptArgs(promptReference, config, undefined, options.toolMode)),
         options.timeoutMs,
         cancellationPath,
       );
@@ -449,7 +468,7 @@ export async function execChildPrompt(
 
     attempt = "retry-without-overrides";
     const retryInvocation = resolveWatchedChildPiInvocation(
-      resolveChildPiInvocation(basePromptArgs(promptReference, config)),
+      resolveChildPiInvocation(basePromptArgs(promptReference, config, options.toolMode)),
       options.timeoutMs,
       cancellationPath,
     );

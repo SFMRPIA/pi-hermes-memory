@@ -96,6 +96,28 @@ describe("runVaultPromotion", () => {
     assert.equal(remaining.some((e) => e.includes("Beta transient")), true, "unpromoted entry kept");
   });
 
+  it("runs the JSON child with all tools disabled", async () => {
+    await store.add("memory", "A stable fact for the promotion plan");
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const pi = {
+      exec: async (command: string, args: string[]) => {
+        calls.push({ command, args });
+        return { code: 0, stdout: JSON.stringify({ promote: [], remove: [] }), stderr: "" };
+      },
+    } as any;
+
+    const result = await runVaultPromotion(pi, store, "memory", makeConfig({ vaultPath: VAULT }));
+
+    assert.equal(result.promoted, 0);
+    assert.equal(result.removed, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].args.filter((arg) => arg === "--no-tools").length, 1);
+    assert.equal(calls[0].args.includes("--tools"), false);
+    const excludeIndex = calls[0].args.indexOf("--exclude-tools");
+    assert.ok(excludeIndex >= 0);
+    assert.equal(calls[0].args[excludeIndex + 1], "mcp__*");
+  });
+
   it("keeps everything when the child output is not JSON", async () => {
     await store.add("memory", "Alpha stable fact");
     const result = await runVaultPromotion(fakePi("not json at all"), store, "memory", makeConfig({ vaultPath: VAULT }));
