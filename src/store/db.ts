@@ -389,6 +389,8 @@ export class DatabaseManager {
     // CHECK(target IN ('memory','user')) constraints to include 'failure'.
     this.ensureLegacySchemaColumns(db);
     this.migrateLegacyMemoriesTargetConstraint(db);
+    // The legacy migration rebuilds memories and drops its indexes.
+    db.exec('CREATE INDEX IF NOT EXISTS idx_memories_scope_content ON memories(target, project, category, content)');
     this.migrateFtsTokenizer(db);
   }
 

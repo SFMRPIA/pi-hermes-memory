@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — fork port of upstream #293
+
+### Improved
+
+- Added a composite SQLite index for exact memory scope/content lookups, including recreation after legacy table migration (upstream [#293](https://github.com/chandra447/pi-hermes-memory/pull/293)).
+
 ## [Unreleased] — fork port of upstream v0.9.10 usage-hit tracking (#262)
 
 ### Added

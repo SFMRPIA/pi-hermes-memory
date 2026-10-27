@@ -182,6 +182,66 @@ describe('DatabaseManager', () => {
       assert.ok(tableNames.includes('message_fts'), 'message_fts table missing');
       assert.ok(tableNames.includes('memory_fts'), 'memory_fts table missing');
     });
+
+    it('uses the composite index for exact memory lookups in every nullable scope', () => {
+      const db = dbManager.getDb();
+      const index = db.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_memories_scope_content'
+      `).get() as { name: string } | undefined;
+      assert.ok(index, 'scope/content index missing');
+
+      const columns = db.prepare("PRAGMA index_info('idx_memories_scope_content')").all() as Array<{ name: string }>;
+      assert.deepStrictEqual(columns.map((column) => column.name), ['target', 'project', 'category', 'content']);
+
+      for (const project of [null, 'test-project']) {
+        for (const category of [null, 'failure']) {
+          const projectCondition = project === null ? 'project IS NULL' : 'project = ?';
+          const categoryCondition = category === null ? 'category IS NULL' : 'category = ?';
+          const sql = `SELECT id FROM memories WHERE target = ? AND ${projectCondition} AND ${categoryCondition} AND content = ? ORDER BY id ASC LIMIT 1`;
+          const params: unknown[] = ['failure'];
+          if (project !== null) params.push(project);
+          if (category !== null) params.push(category);
+          params.push('test content');
+
+          const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{ detail: string }>;
+          assert.match(
+            plan.map((row) => row.detail).join('\n'),
+            /idx_memories_scope_content \(target=\? AND project=\? AND category=\? AND content=\?\)/,
+            sql,
+          );
+        }
+      }
+    });
+
+    it('recreates a missing scope/content index on reopen without changing memory rows', () => {
+      const db = dbManager.getDb();
+      db.prepare(`
+        INSERT INTO memories (project, target, category, content, created, last_referenced)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run('test-project', 'failure', 'failure', 'preserve this row', '2026-10-27', '2026-10-27');
+      db.exec('DROP INDEX IF EXISTS idx_memories_scope_content');
+      dbManager.close();
+
+      dbManager = new DatabaseManager(tmpDir);
+      const reopened = dbManager.getDb();
+      const index = reopened.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_memories_scope_content'
+      `).get();
+      const rows = reopened.prepare(`
+        SELECT project, target, category, content FROM memories
+      `).all();
+
+      assert.ok(index, 'scope/content index was not recreated');
+      assert.deepStrictEqual(rows, [{
+        project: 'test-project',
+        target: 'failure',
+        category: 'failure',
+        content: 'preserve this row',
+      }]);
+    });
+
     it('rebuilds existing unicode61 FTS tables and preserves indexed data', () => {
       const db = dbManager.getDb();
       db.prepare(`
@@ -419,6 +479,16 @@ describe('DatabaseManager', () => {
       assert.strictEqual(rows.length, 2);
       assert.strictEqual(rows[0].content, 'existing memory');
       assert.strictEqual(rows[1].target, 'failure');
+
+      const index = migratedDb.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name = 'idx_memories_scope_content'
+      `).get();
+      assert.ok(index, 'scope/content index must survive the legacy table rebuild');
+      assert.deepStrictEqual(
+        migratedDb.prepare("PRAGMA index_info('idx_memories_scope_content')").all().map((column: { name: string }) => column.name),
+        ['target', 'project', 'category', 'content'],
+      );
 
       migratedManager.close();
     });
